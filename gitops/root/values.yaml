@@ -1,33 +1,25 @@
 # Root app values. Three sources, in increasing precedence:
 #   1. this file                 — defaults and pinned chart versions
 #   2. deploy/config.yaml (git)  — `tier`: the deploy switch
-#   3. the root Application's valuesObject, written by Terraform (EKS) or
+#   3. the root Application's valuesObject, written by Terraform (GKE) or
 #      local/argocd-up.sh (kind) — cluster facts and values that must never
 #      be committed to a public repo (allowedCidrs).
 
-repoURL: https://github.com/didiberman/llm-d-eks-lab.git
+repoURL: https://github.com/didiberman/llm-d-gke-lab.git
 targetRevision: main
 
 tier: none          # none | sim | small | gpu | kimi
 cluster: false      # read by CI, ignored here
 
-environment: eks    # eks | kind
-project: llm-d-eks-lab
+environment: gke    # gke | kind
+project: llm-d-gke-lab
 namespace: llm-d
-
-karpenter:
-  nodeRole: ""
-  discoveryTag: llm-d-eks-lab
 
 allowedCidrs: []
 
 webui:
   enabled: true
 
-# Tiers whose nodes have NVIDIA GPUs (they get the device plugin).
-gpuTiers: [small, gpu, kimi]
-
 versions:
   router: v1.0.0            # oci://ghcr.io/llm-d/charts/llm-d-router-standalone
   openWebui: 18.3.0         # https://helm.openwebui.com/
-  nvidiaDevicePlugin: 0.20.1

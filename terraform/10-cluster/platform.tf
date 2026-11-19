@@ -9,27 +9,43 @@
 # a kubectl binary on the machine running terraform, which is a real wart; the
 # alternative (splitting multi-doc YAML into kubectl_manifest resources) is
 # worse to maintain and breaks whenever upstream adds a document.
+#
+# kubectl authenticates with the same short-lived Google token the providers
+# use, passed by environment (never in triggers, so never in state) — no
+# kubeconfig and no gke-gcloud-auth-plugin needed.
 
 locals {
-  kubeconfig_args = "--region ${var.region} --name ${module.eks.cluster_name}"
+  kubectl_env = {
+    KUBE_HOST  = local.k8s_host
+    KUBE_CA    = google_container_cluster.this.master_auth[0].cluster_ca_certificate
+    KUBE_TOKEN = data.google_client_config.this.access_token
+  }
+
+  kubectl_prelude = <<-EOT
+    set -euo pipefail
+    ca=$(mktemp); trap 'rm -f "$ca"' EXIT
+    printf '%s' "$KUBE_CA" | base64 -d > "$ca"
+    k() { kubectl --server="$KUBE_HOST" --certificate-authority="$ca" --token="$KUBE_TOKEN" "$@"; }
+  EOT
 }
 
 resource "null_resource" "gateway_api_crds" {
   triggers = {
     version = var.gateway_api_version
-    cluster = module.eks.cluster_name
+    cluster = google_container_cluster.this.id
   }
 
   provisioner "local-exec" {
-    command = <<-EOT
-      set -euo pipefail
-      aws eks update-kubeconfig ${local.kubeconfig_args}
-      kubectl apply --server-side -f \
+    interpreter = ["bash", "-c"]
+    environment = local.kubectl_env
+    command     = <<-EOT
+      ${local.kubectl_prelude}
+      k apply --server-side -f \
         https://github.com/kubernetes-sigs/gateway-api/releases/download/${var.gateway_api_version}/standard-install.yaml
     EOT
   }
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.system]
 }
 
 # Gateway API Inference Extension: the InferencePool CRD. This is what llm-d's
@@ -49,14 +65,15 @@ resource "null_resource" "gateway_api_crds" {
 resource "null_resource" "gaie_crds" {
   triggers = {
     version = var.gaie_version
-    cluster = module.eks.cluster_name
+    cluster = google_container_cluster.this.id
   }
 
   provisioner "local-exec" {
-    command = <<-EOT
-      set -euo pipefail
-      aws eks update-kubeconfig ${local.kubeconfig_args}
-      kubectl apply --server-side -f \
+    interpreter = ["bash", "-c"]
+    environment = local.kubectl_env
+    command     = <<-EOT
+      ${local.kubectl_prelude}
+      k apply --server-side -f \
         https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${var.gaie_version}/v1-manifests.yaml
     EOT
   }
@@ -80,7 +97,8 @@ resource "helm_release" "istio_base" {
 }
 
 # OFF BY DEFAULT. llm-d standalone router mode runs its own Envoy sidecar and
-# is exposed by a plain Service of type LoadBalancer (an NLB on EKS), so no
+# is exposed by a plain Service of type LoadBalancer (a passthrough Network
+# Load Balancer on GKE), so no
 # Gateway API dataplane is needed. Istio is kept behind a flag for the
 # gateway-mode path, which this lab does not use — running it anyway would just
 # consume system-node CPU that Prometheus and the router need.
@@ -97,7 +115,7 @@ resource "helm_release" "istiod" {
 
   values = [yamlencode({
     pilot = {
-      nodeSelector = { "llm-d-eks-lab/role" = "system" }
+      nodeSelector = { "${local.label_prefix}/role" = "system" }
       resources = {
         requests = { cpu = "200m", memory = "1Gi" }
       }
@@ -121,10 +139,10 @@ resource "helm_release" "keda" {
   wait = true
 
   values = [yamlencode({
-    nodeSelector = { "llm-d-eks-lab/role" = "system" }
+    nodeSelector = { "${local.label_prefix}/role" = "system" }
   })]
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.system]
 }
 
 # Prometheus. NOT optional: KEDA's prometheus scaler is how EPP demand signals
@@ -139,7 +157,7 @@ resource "helm_release" "keda" {
 #
 # Grafana, Alertmanager and the control-plane scrape jobs are all disabled —
 # this exists to feed KEDA, not to be an observability stack, and the full
-# bundle will not fit alongside everything else on two t3.xlarge nodes.
+# bundle will not fit alongside everything else on the small system pool.
 resource "helm_release" "prometheus" {
   name             = "llmd"
   namespace        = "llm-d-monitoring"
@@ -164,13 +182,13 @@ resource "helm_release" "prometheus" {
     kubeStateMetrics      = { enabled = false }
 
     prometheusOperator = {
-      nodeSelector = { "llm-d-eks-lab/role" = "system" }
+      nodeSelector = { "${local.label_prefix}/role" = "system" }
       resources    = { requests = { cpu = "100m", memory = "256Mi" } }
     }
 
     prometheus = {
       prometheusSpec = {
-        nodeSelector = { "llm-d-eks-lab/role" = "system" }
+        nodeSelector = { "${local.label_prefix}/role" = "system" }
         retention    = "6h"
         # Scrape every ServiceMonitor in the cluster rather than only those
         # carrying this release's labels — the router chart's ServiceMonitor
@@ -184,11 +202,11 @@ resource "helm_release" "prometheus" {
           requests = { cpu = "200m", memory = "1Gi" }
           limits   = { memory = "2Gi" }
         }
-        # Ephemeral on purpose: 6h of lab metrics is not worth an EBS volume
-        # that survives make nuke.
+        # Ephemeral on purpose: 6h of lab metrics is not worth a persistent
+        # disk that outlives the cluster.
       }
     }
   })]
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.system]
 }

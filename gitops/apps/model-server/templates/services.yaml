@@ -1,12 +1,12 @@
 # Public endpoints for the router (OpenAI API) and Open WebUI.
 #
-# EKS: internet-facing NLBs via the controller built into EKS (the AWS Load
-#      Balancer Controller is not installed, so its `external` annotations
-#      would leave the Service pending forever). Source ranges become node
-#      security-group rules; they come from the root app, never from git.
+# GKE: type LoadBalancer = an external passthrough Network Load Balancer (L4,
+#      regional, one forwarding rule each, ~$0.025/hr). No annotation needed.
+#      loadBalancerSourceRanges become VPC firewall rules on the nodes; the
+#      ranges come from the root app, never from git.
 # kind: NodePorts mapped to localhost by local/kind-argocd.yaml.
-{{- $eks := eq .Values.environment "eks" }}
-{{- if and $eks (not .Values.allowedCidrs) }}
+{{- $gke := eq .Values.environment "gke" }}
+{{- if and $gke (not .Values.allowedCidrs) }}
 {{- fail "allowedCidrs is empty — refusing to put unauthenticated endpoints on the internet" }}
 {{- end }}
 apiVersion: v1
@@ -14,12 +14,8 @@ kind: Service
 metadata:
   name: {{ .Values.release }}-public
   namespace: {{ .Values.namespace }}
-  {{- if $eks }}
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: nlb
-  {{- end }}
 spec:
-  type: {{ if $eks }}LoadBalancer{{ else }}NodePort{{ end }}
+  type: {{ if $gke }}LoadBalancer{{ else }}NodePort{{ end }}
   selector:
     # The router chart's pods (verified by rendering it).
     llm-d-router-gateway: {{ .Values.release }}-epp
@@ -28,10 +24,10 @@ spec:
       port: 80
       targetPort: 8081   # the Envoy sidecar's listener
       protocol: TCP
-      {{- if not $eks }}
+      {{- if not $gke }}
       nodePort: 30080
       {{- end }}
-  {{- if $eks }}
+  {{- if $gke }}
   loadBalancerSourceRanges: {{ toJson .Values.allowedCidrs }}
   {{- end }}
 {{- if .Values.webui.enabled }}
@@ -41,12 +37,8 @@ kind: Service
 metadata:
   name: open-webui-public
   namespace: {{ .Values.namespace }}
-  {{- if $eks }}
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: nlb
-  {{- end }}
 spec:
-  type: {{ if $eks }}LoadBalancer{{ else }}NodePort{{ end }}
+  type: {{ if $gke }}LoadBalancer{{ else }}NodePort{{ end }}
   selector:
     app.kubernetes.io/instance: open-webui
     app.kubernetes.io/component: open-webui
@@ -55,10 +47,10 @@ spec:
       port: 80
       targetPort: 8080
       protocol: TCP
-      {{- if not $eks }}
+      {{- if not $gke }}
       nodePort: 30081
       {{- end }}
-  {{- if $eks }}
+  {{- if $gke }}
   loadBalancerSourceRanges: {{ toJson .Values.allowedCidrs }}
   {{- end }}
 {{- end }}

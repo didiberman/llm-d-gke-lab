@@ -1,14 +1,13 @@
-# kimi — moonshotai/Kimi-Dev-72B, the largest Kimi that fits this account.
+# kimi — moonshotai/Kimi-Dev-72B, the largest Kimi that fits two 96 GB GPUs.
 #
 # 72.7B coding model (Qwen2.5-72B base, MIT, ungated), BF16 only: 145 GB on
-# disk, ~135 GiB in VRAM. Tensor-parallel across the two 96 GB RTX PRO 6000s
-# of a g7e.12xlarge, leaving ~34 GiB of KV cache (~110k tokens).
+# disk, ~135 GiB in VRAM. Tensor-parallel across the two RTX PRO 6000s of a
+# g4-standard-96 (96 vCPU, 360 GB RAM), leaving ~34 GiB of KV cache (~110k
+# tokens). The same GPU pair was measured on AWS (g7e.12xlarge) by llm-d-eks-lab.
 #
-# ONE replica, on-demand: the node is 48 vCPU, the on-demand G/VT quota is 64
-# and the spot quota 8. ~$8.29/hr. Measured cold start ~12-15 min.
-#
-# Fallback if g7e misbehaves: g6e.12xlarge (4x L40S, 48 vCPU, $10.49/hr) with
-# gpu.count 4 and --tensor-parallel-size 4.
+# ONE replica, Spot: ~$3.44/hr (on-demand would be $9.00). Takes both GPUs of a
+# 2-GPU quota and 96 vCPU. Cold start ~15-25 min: 145 GB through a Hyperdisk
+# Balanced boot disk, whose baseline throughput a ComputeClass cannot raise.
 tier: kimi
 model: moonshotai/Kimi-Dev-72B
 image: docker.io/vllm/vllm-openai:v0.30.0
@@ -35,7 +34,7 @@ args:
   - /health,/metrics,/v1/models
   - --shutdown-timeout
   - "45"
-# 48 vCPU / 512 GB node with nothing else on it; the high memory limit is page
+# 96 vCPU / 360 GB node with nothing else on it; the high memory limit is page
 # cache while 145 GB of safetensors stream to the GPUs.
 resources:
   cpuRequest: "16"
@@ -46,13 +45,18 @@ shmSize: 16Gi
 # 145 GB to download and load: 240 x 10s = 40 minutes.
 startupProbeFailureThreshold: 240
 capacity:
-  instanceTypes: [g7e.12xlarge]
-  capacityTypes: [on-demand]
-  vcpuLimit: 48
-  diskSizeGb: 400
-  # gp3 baseline (125 MB/s) needs ~20 min just to write the weights.
-  diskThroughputMbps: 1000
-  diskIops: 8000
+  priorities:
+    - machineType: g4-standard-96
+      spot: true
+      gpu:
+        type: nvidia-rtx-pro-6000
+        count: 2
+        driverVersion: latest
+      storage:
+        bootDiskType: hyperdisk-balanced
+        bootDiskSize: 400
+  whenUnsatisfiable: DoNotScaleUp
+  consolidationDelayMinutes: 2
 autoscaling:
   minReplicas: 1
   maxReplicas: 1

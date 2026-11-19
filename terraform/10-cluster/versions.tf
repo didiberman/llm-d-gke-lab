@@ -1,18 +1,18 @@
 terraform {
   required_version = "~> 1.13"
 
-  # Partial backend config: bucket and region come from `-backend-config` at
-  # init time, sourced from the 00-bootstrap outputs. `make cluster` wires it.
-  backend "s3" {
-    key          = "10-cluster/terraform.tfstate"
-    encrypt      = true
-    use_lockfile = true
+  # Bucket created by 00-bootstrap (<project_id>-tfstate), passed at init:
+  #   terraform init -backend-config="bucket=<project_id>-tfstate"
+  # (CI and `make cluster-plan` do this.) The prefix keeps each layer's state
+  # separate.
+  backend "gcs" {
+    prefix = "10-cluster"
   }
 
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.0"
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 7.0"
     }
     helm = {
       source  = "hashicorp/helm"
@@ -26,61 +26,38 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
-    # For the root Argo CD Application: hashicorp/kubernetes' kubernetes_manifest
-    # needs the CRD to exist at *plan* time, which a from-scratch apply (Argo CD
-    # installed in the same run) cannot satisfy. This provider applies raw YAML.
-    kubectl = {
-      source  = "alekc/kubectl"
-      version = "~> 2.1"
-    }
   }
 }
 
-provider "aws" {
-  region = var.region
-
-  default_tags {
-    tags = local.tags
-  }
+provider "google" {
+  project = var.project_id
+  region  = var.region
 }
 
-# Auth via the cluster's own API endpoint. `exec` keeps the token fresh rather
-# than baking a 15-minute one into state.
+# Kubernetes auth uses the caller's own Google access token (CI: the deploy
+# SA via Workload Identity Federation; locally: gcloud ADC). No kubeconfig,
+# no gke-gcloud-auth-plugin, nothing long-lived in state.
+data "google_client_config" "this" {}
+
+locals {
+  k8s_host = "https://${google_container_cluster.this.endpoint}"
+  k8s_ca   = base64decode(google_container_cluster.this.master_auth[0].cluster_ca_certificate)
+
+  label_prefix         = var.name
+  node_service_account = coalesce(var.node_service_account, "gke-nodes@${var.project_id}.iam.gserviceaccount.com")
+}
+
 provider "kubernetes" {
-  host                   = module.eks.cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
-  }
+  host                   = local.k8s_host
+  cluster_ca_certificate = local.k8s_ca
+  token                  = data.google_client_config.this.access_token
 }
 
-# helm provider v3 takes `kubernetes` as an attribute, not a block (it was a
-# block in v2) — hence the equals sign and the nested object syntax.
+# helm provider v3 takes `kubernetes` as an attribute, not a block.
 provider "helm" {
   kubernetes = {
-    host                   = module.eks.cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-
-    exec = {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      command     = "aws"
-      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
-    }
-  }
-}
-
-provider "kubectl" {
-  host                   = module.eks.cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-  load_config_file       = false
-  apply_retry_count      = 3
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+    host                   = local.k8s_host
+    cluster_ca_certificate = local.k8s_ca
+    token                  = data.google_client_config.this.access_token
   }
 }

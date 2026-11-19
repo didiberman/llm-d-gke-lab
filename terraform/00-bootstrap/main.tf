@@ -1,99 +1,111 @@
-# Remote state backing store.
+# 00-bootstrap: everything that has to exist before CI can deploy anything,
+# applied once by hand with the operator's own credentials.
 #
-# Deliberately no DynamoDB lock table: Terraform 1.10+ locks S3 state natively
-# via `use_lockfile = true` in the backend config, which makes the table pure
-# cost and moving parts. This layer's own state also lives in the bucket — see
-# the backend block in versions.tf for the first-apply-on-a-new-account dance.
+#   project + billing link   the container for all spend; delete it = $0
+#   APIs                     enabled here so 10-cluster never needs serviceusage.admin
+#   state bucket             holds this layer's state and 10-cluster's
+#   node service account     what GKE nodes run as (minimal, not the Compute default)
+#   quota requests           GPUs and vCPUs; a new project can launch neither
+#   budget                   email backstop
+#   github.tf                Workload Identity Federation + the deploy SA CI uses
 
-data "aws_caller_identity" "current" {}
+resource "google_project" "this" {
+  name            = var.project_name
+  project_id      = var.project_id
+  org_id          = var.org_id
+  billing_account = var.billing_account
+  labels          = var.labels
 
-locals {
-  bucket_name = coalesce(
-    var.state_bucket_name,
-    "${var.project}-tfstate-${data.aws_caller_identity.current.account_id}"
-  )
+  # 10-cluster builds its own VPC; the default network's permissive firewall
+  # rules are just attack surface.
+  auto_create_network = false
+
+  # Deleting the project deletes everything in it, state bucket included.
+  # `make nuke` is the deliberate path; a stray `terraform destroy` is not.
+  deletion_policy = "PREVENT"
 }
 
-resource "aws_s3_bucket" "this" {
-  bucket = local.bucket_name
+locals {
+  apis = [
+    "cloudbilling.googleapis.com",
+    "billingbudgets.googleapis.com",
+    "cloudquotas.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "serviceusage.googleapis.com",
+    "storage.googleapis.com",
+    "sts.googleapis.com",
+  ]
+}
 
-  # State for a disposable practice cluster, but losing it mid-apply orphans a
-  # live EKS cluster that then has to be cleaned up by hand. Keep the guard.
+resource "google_project_service" "this" {
+  for_each = toset(local.apis)
+
+  project = google_project.this.project_id
+  service = each.value
+
+  # Turning an API off on destroy can cascade into deleting its resources.
+  # The project is the unit of teardown, not individual APIs.
+  disable_on_destroy = false
+}
+
+# ---------------------------------------------------------------------------
+# Remote state
+# ---------------------------------------------------------------------------
+
+resource "google_storage_bucket" "tfstate" {
+  project  = google_project.this.project_id
+  name     = "${var.project_id}-tfstate"
+  location = var.region
+  labels   = var.labels
+
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  # GCS backend locks natively with a lock object; no extra table to run.
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 10
+      with_state         = "ARCHIVED"
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  # Losing state mid-apply orphans a live cluster that must be cleaned up by hand.
+  force_destroy = false
   lifecycle {
     prevent_destroy = true
   }
+
+  depends_on = [google_project_service.this]
 }
 
-resource "aws_s3_bucket_versioning" "this" {
-  bucket = aws_s3_bucket.this.id
+# ---------------------------------------------------------------------------
+# Node service account. Created here, not in 10-cluster, so the CI deploy SA
+# only needs to *use* it, never to create service accounts or grant IAM roles
+# (either of which would let CI escalate to owner).
+# ---------------------------------------------------------------------------
 
-  versioning_configuration {
-    status = "Enabled"
-  }
+resource "google_service_account" "gke_nodes" {
+  project      = google_project.this.project_id
+  account_id   = "gke-nodes"
+  display_name = "GKE nodes (${var.project_id})"
+  description  = "Runs GKE node VMs. Logging/monitoring only; no access to project data."
+
+  depends_on = [google_project_service.this]
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# State files hold cluster endpoints and tokens. Deny any non-TLS access.
-resource "aws_s3_bucket_policy" "deny_insecure_transport" {
-  bucket = aws_s3_bucket.this.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyInsecureTransport"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:*"
-      Resource = [
-        aws_s3_bucket.this.arn,
-        "${aws_s3_bucket.this.arn}/*",
-      ]
-      Condition = {
-        Bool = { "aws:SecureTransport" = "false" }
-      }
-    }]
-  })
-
-  depends_on = [aws_s3_bucket_public_access_block.this]
-}
-
-# Old state versions have no value here and versioning would otherwise
-# accumulate them forever.
-resource "aws_s3_bucket_lifecycle_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  rule {
-    id     = "expire-noncurrent-state"
-    status = "Enabled"
-
-    filter {}
-
-    noncurrent_version_expiration {
-      noncurrent_days = 30
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
-    }
-  }
-
-  depends_on = [aws_s3_bucket_versioning.this]
+resource "google_project_iam_member" "gke_nodes" {
+  project = google_project.this.project_id
+  role    = "roles/container.defaultNodeServiceAccount"
+  member  = google_service_account.gke_nodes.member
 }

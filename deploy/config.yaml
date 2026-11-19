@@ -1,16 +1,21 @@
 # Desired state of the lab. Commit + push to change it.
 #
-# cluster  Whether the EKS cluster should exist. CI never creates it while this
-#          is false, so no push can start the ~$0.26/hr base cost by accident.
-#          Tearing down is the manual destroy workflow (or `make destroy`).
+# cluster  Whether the GKE cluster should exist. CI never creates it while this
+#          is false, so no push can start the base cost by accident (~$0.09/hr:
+#          one Spot e2-standard-4 system node; the zonal control plane is
+#          covered by GKE's free tier). Tearing down is the manual destroy
+#          workflow (or `make destroy`).
 #
-# tier     What Argo CD runs on the cluster:
-#            none   nothing — Argo CD prunes the inference layer, Karpenter
-#                   returns the nodes (cluster stays, ~$0.26/hr)
-#            sim    llm-d-inference-sim, no GPU                   ~$0.03/hr
-#            small  Qwen3.5-4B on g6.xlarge (L4), spot           ~$0.53/hr/replica
-#            gpu    Qwen3.6-27B-FP8 on g6e.xlarge (L40S), spot   ~$1.80/hr/replica
-#            kimi   Kimi-Dev-72B on g7e.12xlarge (2x 96 GB)      ~$8.42/hr
+# tier     What Argo CD runs on the cluster (Spot, us-central1 list prices):
+#            none   nothing — Argo CD prunes the inference layer, GKE removes
+#                   the nodes (cluster stays, ~$0.09/hr)
+#            sim    llm-d-inference-sim on e2-standard-2, no GPU   ~$0.04/hr
+#            small  Qwen3.5-4B on g2-standard-4 (1x L4)            ~$0.42/hr/replica
+#            gpu    Qwen3.6-27B-FP8 on g4-standard-48              ~$1.72/hr/replica
+#                   (1x RTX PRO 6000 96 GB), 1->2 replicas
+#            kimi   Kimi-Dev-72B on g4-standard-96 (2x RTX PRO 6000) ~$3.44/hr
+#          Tiers other than none add two load balancers (~$0.025/hr together).
+#          GPU tiers need GPU quota granted on the project: `make quota`.
 #
 # Nothing resets tier automatically: set it back to none when you are done.
 cluster: false

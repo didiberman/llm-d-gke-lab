@@ -2,6 +2,9 @@
 {{- if not (has .Values.tier $tiers) }}
 {{- fail (printf "tier must be one of %v, got %q" $tiers .Values.tier) }}
 {{- end }}
+{{- if not (has .Values.environment (list "gke" "kind")) }}
+{{- fail (printf "environment must be gke or kind, got %q" .Values.environment) }}
+{{- end }}
 {{- if ne .Values.tier "none" }}
 # The llm-d router: Envoy + endpoint picker in front of the model servers.
 apiVersion: argoproj.io/v1alpha1
@@ -29,7 +32,8 @@ spec:
       ref: values
   {{- include "root.sync" . }}
 ---
-# Capacity + model server + autoscaling + public endpoints for the tier.
+# Capacity (a GKE ComputeClass) + model server + autoscaling + public
+# endpoints for the tier.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -52,10 +56,6 @@ spec:
         environment: {{ .Values.environment }}
         project: {{ .Values.project }}
         namespace: {{ .Values.namespace }}
-        karpenter:
-          enabled: {{ eq .Values.environment "eks" }}
-          nodeRole: {{ .Values.karpenter.nodeRole | quote }}
-          discoveryTag: {{ .Values.karpenter.discoveryTag }}
         allowedCidrs: {{ toJson .Values.allowedCidrs }}
         webui:
           enabled: {{ .Values.webui.enabled }}
@@ -94,32 +94,5 @@ spec:
       targetRevision: {{ .Values.targetRevision }}
       ref: values
   {{- include "root.sync" . }}
-{{- end }}
-{{- if and (eq .Values.environment "eks") (has .Values.tier .Values.gpuTiers) }}
----
-# Makes GPU nodes advertise nvidia.com/gpu (missing from the AL2023 AMI).
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: nvidia-device-plugin
-  {{- include "root.common" . }}
-spec:
-  project: default
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: nvidia-device-plugin
-  sources:
-    - repoURL: https://nvidia.github.io/k8s-device-plugin
-      chart: nvidia-device-plugin
-      targetRevision: {{ .Values.versions.nvidiaDevicePlugin }}
-      helm:
-        valueFiles:
-          - $values/gitops/values/nvidia-device-plugin.yaml
-    - repoURL: {{ .Values.repoURL }}
-      targetRevision: {{ .Values.targetRevision }}
-      ref: values
-  {{- include "root.sync" . }}
-    syncOptions:
-      - CreateNamespace=true
 {{- end }}
 {{- end }}

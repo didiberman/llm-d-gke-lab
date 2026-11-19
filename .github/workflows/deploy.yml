@@ -1,28 +1,31 @@
 # Deploy — infrastructure by Terraform, everything on the cluster by Argo CD.
 #
 #   terraform/10-cluster/**   -> cluster job: terraform plan, apply if non-empty
-#                                (EKS, Karpenter, KEDA, Prometheus, Argo CD and
-#                                the root Application)
+#                                (VPC, GKE + node auto-provisioning, KEDA,
+#                                Prometheus, Argo CD and the root Application)
 #   gitops/**, deploy/**      -> verify job: nothing to apply — Argo CD pulls the
 #                                change from git. CI asks it to refresh now,
 #                                waits for every app to be Synced + Healthy, and
 #                                smoke-tests the model.
 #
 # deploy/config.yaml is the switch:
-#   cluster: false  CI never creates the cluster (no accidental $0.26/hr)
+#   cluster: false  CI never creates the cluster (no accidental spend)
 #   tier: <name>    what Argo CD runs; none prunes the inference layer
 #
 # Docs and anything else never trigger this workflow. 00-bootstrap is not
-# applied here: it creates the role this workflow assumes.
+# applied here: it creates the identity this workflow uses.
 #
-# SETUP (one time):
-#   secret   AWS_DEPLOY_ROLE_ARN  = 00-bootstrap output github_deploy_role_arn
-#   secret   ALLOWED_CIDRS        = JSON list, e.g. ["1.2.3.4/32"] (a secret so the
-#                                   IP is masked in public logs)
-#   secret   HF_TOKEN             = optional, HuggingFace token
-#   secret   BUDGET_ALERT_EMAIL   = optional, enables the AWS Budget alert
-#   variable STATE_BUCKET         = 00-bootstrap output state_bucket
-#   variable ADMIN_PRINCIPAL_ARN  = IAM user/role that gets kubectl access
+# Auth: GitHub OIDC -> Workload Identity Federation -> the github-deploy service
+# account. No keys anywhere. The provider only admits this repo on main.
+#
+# SETUP (one time, values from `terraform -chdir=terraform/00-bootstrap output`
+# or `make github-setup`):
+#   variable GCP_PROJECT_ID                  = output project_id
+#   secret   GCP_WORKLOAD_IDENTITY_PROVIDER  = output workload_identity_provider
+#   secret   GCP_DEPLOY_SERVICE_ACCOUNT      = output deploy_service_account
+#   secret   ALLOWED_CIDRS                   = JSON list, e.g. ["1.2.3.4/32"] (a
+#                                              secret so the IP is masked in logs)
+#   secret   HF_TOKEN                        = optional, HuggingFace token
 name: deploy
 
 on:
@@ -42,12 +45,14 @@ permissions:
 
 # Shared with destroy: never race an apply against a teardown.
 concurrency:
-  group: aws-llm-d-eks-lab
+  group: gcp-llm-d-gke-lab
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-west-2
-  CLUSTER: llm-d-eks-lab
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: us-central1
+  ZONE: us-central1-b # keep in sync with terraform/10-cluster var.zone
+  CLUSTER: llm-d-gke-lab
   TF_IN_AUTOMATION: "1"
   TF_INPUT: "0"
   TF_VERSION: "1.13.4"
@@ -116,15 +121,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
+      - name: Check setup
+        run: |
+          [ -n "$PROJECT_ID" ] || { echo "::error::Repo variable GCP_PROJECT_ID is not set (see the SETUP comment in deploy.yml)"; exit 1; }
+          [ -n "${{ secrets.ALLOWED_CIDRS }}" ] || { echo "::error::Secret ALLOWED_CIDRS is not set — the public endpoints would be refused"; exit 1; }
 
-      # Actions logs are public on a public repo.
-      - name: Mask account ID
-        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       - uses: hashicorp/setup-terraform@v4
         with:
@@ -134,55 +139,22 @@ jobs:
       # Only export inputs that are set: an empty TF_VAR_ is "", not null.
       - name: Terraform inputs
         env:
-          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          ADMIN_PRINCIPAL_ARN: ${{ vars.ADMIN_PRINCIPAL_ARN }}
-          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
           ALLOWED_CIDRS: ${{ secrets.ALLOWED_CIDRS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
-          [ -n "${{ vars.STATE_BUCKET }}" ] || { echo "::error::Repo variable STATE_BUCKET is not set"; exit 1; }
-          [ -n "$ALLOWED_CIDRS" ] || { echo "::error::Secret ALLOWED_CIDRS is not set — the public endpoints would be refused"; exit 1; }
           {
-            echo "TF_VAR_region=$AWS_REGION"
-            echo "TF_VAR_project=$CLUSTER"
-            echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
+            echo "TF_VAR_project_id=$PROJECT_ID"
+            echo "TF_VAR_region=$REGION"
+            echo "TF_VAR_zone=$ZONE"
+            echo "TF_VAR_name=$CLUSTER"
             echo "TF_VAR_allowed_cidrs=$ALLOWED_CIDRS"
-            [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
-            [ -n "$BUDGET_ALERT_EMAIL" ] && echo "TF_VAR_budget_alert_email=$BUDGET_ALERT_EMAIL"
             [ -n "$HF_TOKEN" ] && echo "TF_VAR_hf_token=$HF_TOKEN"
             true
           } >> "$GITHUB_ENV"
 
       - name: terraform init
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
-            -backend-config="region=${AWS_REGION}"
-
-      # A cluster built before this role existed has no access entry for it,
-      # and the Helm/Kubernetes providers cannot refresh without one. Create it
-      # out of band, then adopt it into state. A no-op after the first run.
-      - name: Ensure this role can reach an existing cluster
-        env:
-          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-        run: |
-          set -euo pipefail
-          admin_policy="arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-          if ! aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
-            echo "No cluster yet — Terraform will create it with this role's access entry."
-            exit 0
-          fi
-          if ! aws eks describe-access-entry --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" >/dev/null 2>&1; then
-            aws eks create-access-entry --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" --type STANDARD >/dev/null
-            aws eks associate-access-policy --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" \
-              --policy-arn "$admin_policy" --access-scope type=cluster >/dev/null
-            sleep 20
-          fi
-          terraform state show 'module.eks.aws_eks_access_entry.this["deploy"]' >/dev/null 2>&1 || \
-            terraform import 'module.eks.aws_eks_access_entry.this["deploy"]' "${CLUSTER}:${DEPLOY_ROLE_ARN}"
-          terraform state show 'module.eks.aws_eks_access_policy_association.this["deploy_admin"]' >/dev/null 2>&1 || \
-            terraform import 'module.eks.aws_eks_access_policy_association.this["deploy_admin"]' "${CLUSTER}#${DEPLOY_ROLE_ARN}#${admin_policy}"
+        run: terraform init -backend-config="bucket=${PROJECT_ID}-tfstate"
 
       - name: terraform plan
         id: plan
@@ -212,39 +184,45 @@ jobs:
       needs.scope.outputs.gitops == 'true' &&
       (needs.cluster.result == 'success' || needs.cluster.result == 'skipped')
     runs-on: ubuntu-latest
-    # Kimi pulls 145 GB of weights; a cold start is ~15 minutes.
-    timeout-minutes: 75
+    # Kimi pulls 145 GB of weights; a cold start is 15-25 minutes, plus waiting
+    # for a Spot GPU node.
+    timeout-minutes: 90
     env:
       TIER: ${{ needs.scope.outputs.tier }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: aws-actions/configure-aws-credentials@v6
+      - uses: google-github-actions/auth@v3
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
-      - name: Mask account ID
-        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+      - uses: google-github-actions/setup-gcloud@v3
 
       - name: Cluster present?
         id: cluster
         run: |
-          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+          if gcloud container clusters describe "$CLUSTER" --zone "$ZONE" --project "$PROJECT_ID" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER" >/dev/null
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "::warning::cluster: true but no cluster exists — push a change under terraform/10-cluster/ or run this workflow manually to create it."
           fi
 
+      # Writes a kubeconfig holding a short-lived token: no auth plugin needed.
+      - uses: google-github-actions/get-gke-credentials@v3
+        if: steps.cluster.outputs.exists == 'true'
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.ZONE }}
+          project_id: ${{ env.PROJECT_ID }}
+
       - name: Wait for Argo CD to converge on git
         if: steps.cluster.outputs.exists == 'true'
-        run: ./scripts/wait-for-apps.sh 3600
+        run: ./scripts/wait-for-apps.sh 4500
 
-      # Through a port-forward rather than the public NLB: ALLOWED_CIDRS
-      # normally excludes GitHub's runners.
+      # Through a port-forward rather than the public load balancer:
+      # ALLOWED_CIDRS normally excludes GitHub's runners.
       - name: Smoke test
         if: steps.cluster.outputs.exists == 'true' && env.TIER != 'none'
         run: |
@@ -258,8 +236,8 @@ jobs:
           echo "$resp" | jq . || echo "$resp"
           text=$(echo "$resp" | jq -r '.choices[0].text // empty')
           [ -n "$text" ] || { echo "::error::No completion returned by $model"; exit 1; }
-          api=$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-          ui=$(kubectl -n llm-d get svc open-webui-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          api=$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          ui=$(kubectl -n llm-d get svc open-webui-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
           {
             echo "### Serving \`$model\` (tier: $TIER)"
             echo "- Model API: \`http://${api:-<pending>}\`"
@@ -270,7 +248,9 @@ jobs:
       - name: Confirm the inference layer is gone (tier none)
         if: steps.cluster.outputs.exists == 'true' && env.TIER == 'none'
         run: |
-          left=$(kubectl get nodepools.karpenter.sh --no-headers 2>/dev/null | grep -c . || true)
-          echo "NodePools remaining: $left"
-          [ "$left" -eq 0 ] || { echo "::error::tier none but $left NodePool(s) remain"; exit 1; }
-          echo "### tier: none — inference layer pruned, cluster idle" >> "$GITHUB_STEP_SUMMARY"
+          left=$(kubectl get computeclasses.cloud.google.com -l "app.kubernetes.io/part-of=${CLUSTER}" --no-headers 2>/dev/null | grep -c . || true)
+          echo "Lab ComputeClasses remaining: $left"
+          [ "$left" -eq 0 ] || { echo "::error::tier none but $left ComputeClass(es) remain"; exit 1; }
+          # Nodes drain after consolidationDelayMinutes; report, don't wait.
+          gpu=$(kubectl get nodes -l cloud.google.com/gke-accelerator --no-headers 2>/dev/null | grep -c . || true)
+          echo "### tier: none — inference layer pruned; GPU nodes still draining: $gpu" >> "$GITHUB_STEP_SUMMARY"

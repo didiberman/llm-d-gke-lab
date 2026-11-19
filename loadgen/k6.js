@@ -3,7 +3,7 @@
 // Ramps concurrency in stages. The goal is not throughput measurement — it is
 // to push llm_d_epp_flow_control_queue_size above the KEDA threshold long
 // enough for the HPA's stabilization window to elapse, so you can watch a
-// replica (and on EKS, a GPU node) get added and then reclaimed.
+// replica (and on GKE, a GPU node) get added and then reclaimed.
 //
 //   BASE_URL  endpoint, default localhost:8080 (the kind NodePort)
 //   MODEL     must match the served model name exactly
@@ -20,7 +20,7 @@ const ttft = new Trend('time_to_first_byte', true);
 
 export const options = {
   // Stages are long because the HPA stabilization window is 30s locally and
-  // 300s on EKS. Shorter bursts get damped away and you see nothing happen.
+  // 300s on GKE. Shorter bursts get damped away and you see nothing happen.
   stages: [
     { duration: '30s', target: 2 },
     { duration: '2m', target: MAX_VUS },

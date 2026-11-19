@@ -1,0 +1,36 @@
+{{- if eq .Values.environment "gke" }}
+{{- if not .Values.capacity.priorities }}
+{{- fail "capacity.priorities is empty — a GKE tier needs at least one machine shape" }}
+{{- end }}
+# Capacity for this tier — GKE's equivalent of a Karpenter NodePool +
+# EC2NodeClass. Pods select it by name (cloud.google.com/compute-class), and
+# GKE node auto-provisioning creates a node pool from the first priority it
+# can satisfy, then deletes the pool when its last node goes.
+#
+# Deleting this object (tier: none, or the app being pruned) leaves nothing to
+# schedule there; the autoscaler drains and deletes the nodes after
+# consolidationDelayMinutes. That is what takes idle GPU cost to zero.
+#
+# The hard ceiling is not here: it is the cluster's resource_limits
+# (terraform/10-cluster/gke.tf), which no ComputeClass can exceed.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: {{ include "ms.computeclass" . }}
+  labels:
+    {{- include "ms.partOf" . | nindent 4 }}
+spec:
+  description: {{ printf "llm-d %s tier (%s)" .Values.tier .Values.model | quote }}
+  priorities:
+    {{- toYaml .Values.capacity.priorities | nindent 4 }}
+  nodePoolAutoCreation:
+    enabled: true
+  whenUnsatisfiable: {{ .Values.capacity.whenUnsatisfiable }}
+  autoscalingPolicy:
+    consolidationDelayMinutes: {{ .Values.capacity.consolidationDelayMinutes }}
+  nodePoolConfig:
+    # For `kubectl get nodes -L` and billing; scheduling uses the class name.
+    nodeLabels:
+      {{ .Values.project }}/role: model-server
+      {{ .Values.project }}/tier: {{ .Values.tier }}
+{{- end }}

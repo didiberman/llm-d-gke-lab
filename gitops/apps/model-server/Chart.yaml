@@ -1,8 +1,8 @@
 apiVersion: v2
 name: model-server
 description: >-
-  The per-tier inference workload behind the llm-d router: Karpenter capacity
-  (EC2NodeClass + NodePool), the vLLM or simulator Deployment, the KEDA
+  The per-tier inference workload behind the llm-d router: GKE capacity
+  (a ComputeClass), the vLLM or simulator Deployment, the KEDA
   ScaledObject that scales it on EPP queue depth, and the public endpoints.
 type: application
 version: 1.0.0

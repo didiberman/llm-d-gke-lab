@@ -3,9 +3,9 @@
 # It talks to the llm-d router's in-cluster OpenAI-compatible API, so every
 # chat goes through the EPP exactly like API traffic does.
 #
-# Deliberately light: no Ollama, Pipelines, Redis or Tika; no persistence (the
-# cluster has no EBS CSI driver, and `tier: none` wipes the inference layer
-# anyway). Auth is off because the public Service only admits
+# Deliberately light: no Ollama, Pipelines, Redis or Tika; no persistence (a
+# PersistentVolume is a disk that bills until deleted, and `tier: none` wipes
+# the inference layer anyway). Auth is off because the public Service only admits
 # allowedCidrs — the same boundary as the model API, which has no auth either.
 # Widen allowedCidrs and you must set WEBUI_AUTH back to True.
 ollama:
@@ -39,7 +39,7 @@ extraEnvVars:
     value: "False"
 
 nodeSelector:
-  llm-d-eks-lab/role: system
+  llm-d-gke-lab/role: system
 
 resources:
   requests:

@@ -1,6 +1,6 @@
-# Argo CD install values — shared by Terraform on EKS (terraform/10-cluster/
+# Argo CD install values — shared by Terraform on GKE (terraform/10-cluster/
 # argocd.tf) and local/argocd-up.sh on kind, so the local proof runs exactly
-# what AWS runs.
+# what GKE runs.
 #
 # Lean on purpose: one repo, one root app, no SSO, no notifications, no
 # ApplicationSets. The UI is reached with `make argocd-ui` (port-forward), never
@@ -9,7 +9,7 @@
 global:
   # Platform controllers stay off GPU nodes.
   nodeSelector:
-    llm-d-eks-lab/role: system
+    llm-d-gke-lab/role: system
 
 configs:
   params:

@@ -11,17 +11,15 @@ fail=0
 
 ms() { # env tier
   local extra=()
-  if [ "$1" = eks ]; then
-    extra=(--set karpenter.nodeRole=example-node-role --set-json 'allowedCidrs=["203.0.113.7/32"]')
-  else
-    extra=(--set karpenter.enabled=false)
+  if [ "$1" = gke ]; then
+    extra=(--set-json 'allowedCidrs=["203.0.113.7/32"]')
   fi
   helm template llm-d-model gitops/apps/model-server -f "gitops/tiers/$2.yaml" \
-    --set environment="$1" "${extra[@]}"
+    --set environment="$1" ${extra[@]+"${extra[@]}"}
 }
 
 echo "== model-server chart"
-for env in eks kind; do
+for env in gke kind; do
   for t in sim small gpu kimi; do
     if ms "$env" "$t" > "$OUT/model-$env-$t.yaml" 2>"$OUT/err"; then
       printf '  ok    %-5s %-6s %s\n' "$env" "$t" "$(grep -E '^kind:' "$OUT/model-$env-$t.yaml" | awk '{print $2}' | sort | tr '\n' ' ')"
@@ -32,7 +30,7 @@ for env in eks kind; do
 done
 
 echo "== root chart (app of apps)"
-for env in eks kind; do
+for env in gke kind; do
   for t in none sim small gpu kimi; do
     if helm template root gitops/root -f deploy/config.yaml --set tier="$t" --set environment="$env" \
         > "$OUT/root-$env-$t.yaml" 2>"$OUT/err"; then
@@ -50,10 +48,12 @@ expect_fail() { # description, command...
   if "$@" >/dev/null 2>&1; then echo "  FAIL  accepted: $d"; fail=1; else echo "  ok    refused: $d"; fi
 }
 expect_fail "unknown tier" helm template r gitops/root --set tier=bogus
-expect_fail "EKS endpoints with no allowedCidrs" \
-  helm template m gitops/apps/model-server -f gitops/tiers/sim.yaml --set karpenter.nodeRole=r
-expect_fail "Karpenter with no node role" \
-  helm template m gitops/apps/model-server -f gitops/tiers/sim.yaml --set-json 'allowedCidrs=["1.2.3.4/32"]'
+expect_fail "unknown environment" helm template r gitops/root --set environment=eks
+expect_fail "GKE endpoints with no allowedCidrs" \
+  helm template m gitops/apps/model-server -f gitops/tiers/sim.yaml
+expect_fail "GKE tier with no machine shapes" \
+  helm template m gitops/apps/model-server -f gitops/tiers/sim.yaml \
+    --set-json 'allowedCidrs=["1.2.3.4/32"]' --set-json 'capacity.priorities=[]'
 
 echo "== deploy/config.yaml"
 tier=$(awk '/^tier:/{print $2}' deploy/config.yaml)
@@ -63,7 +63,7 @@ case "$cluster" in true|false) echo "  ok    cluster=$cluster" ;; *) echo "  FAI
 
 if command -v kubeconform >/dev/null; then
   echo "== kubeconform (Kubernetes + CRD schemas)"
-  # Karpenter, KEDA and Argo CD schemas come from the community CRD catalog.
+  # ComputeClass, KEDA and Argo CD schemas come from the community CRD catalog.
   if kubeconform -strict -summary -ignore-missing-schemas \
       -schema-location default \
       -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \

@@ -1,33 +1,33 @@
-# llm-d on EKS — autoscaled LLM inference you can afford to practice on
+# llm-d on GKE — autoscaled LLM inference you can afford to practice on
 
 [![llm-d: Serving LLMs on Kubernetes](docs/llm-d-architecture-cover.webp)](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes)
 
-**Read the article:** [llm-d in Plain English: Serving LLMs on Kubernetes](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes) - the plain-English story behind this repo.
+**Read the article:** [llm-d in Plain English: Serving LLMs on Kubernetes](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes) - the plain-English story behind this repo and its AWS twin, [llm-d-eks-lab](https://github.com/didiberman/llm-d-eks-lab).
 
 A learning lab: [llm-d](https://llm-d.ai) **v1.0.0** serving open-weights models
-on EKS, autoscaled on **inference queue depth** (not CPU), with GPU nodes that
-appear when needed and disappear when idle. **Terraform + GitHub Actions** build
-the infrastructure; **Argo CD** runs everything on the cluster from git. A
-`git push` is the only deploy button.
+on Google Kubernetes Engine, autoscaled on **inference queue depth** (not CPU),
+with Spot GPU nodes that appear when needed and disappear when idle.
+**Terraform + GitHub Actions** build the infrastructure; **Argo CD** runs
+everything on the cluster from git. A `git push` is the only deploy button.
 
-It is not "production grade." It is a practice environment where a real 72B
-model costs about **$8.70/hour** while you use it and **nothing** once you
-switch it off — one line in git takes the GPUs away, one workflow takes
-everything else.
+It is not "production grade." It is a practice environment where a 27B model on
+a 96 GB RTX PRO 6000 costs about **$1.86/hour** while you use it, a 72B model on
+two of them about **$3.60/hour**, and **nothing** once you switch it off.
 
 ```
- git push ─┬─▶ GitHub Actions (OIDC) ─▶ Terraform ─▶ VPC, EKS, IAM, Karpenter,
-           │                                         KEDA, Prometheus, Argo CD
+ git push ─┬─▶ GitHub Actions (OIDC → Workload Identity) ─▶ Terraform ─▶ VPC, GKE + node
+           │                                                            auto-provisioning,
+           │                                                            KEDA, Prometheus, Argo CD
            │
-           └─▶ Argo CD (pulls from git) ───────────▶ llm-d router + endpoint picker
-                                                     vLLM model server (KEDA-scaled)
-                                                     Karpenter NodePool (GPU nodes on demand)
-                                                     Open WebUI · NVIDIA device plugin
+           └─▶ Argo CD (pulls from git) ───────────────────────────────▶ llm-d router + endpoint picker
+                                                                         vLLM model server (KEDA-scaled)
+                                                                         ComputeClass (Spot GPU nodes on demand)
+                                                                         Open WebUI
 ```
 
 > **New to LLM serving or Kubernetes?** Start with
-> [Serving LLMs on Kubernetes, in plain English](#serving-llms-on-kubernetes-in-plain-english). Already know the
-> pieces? Jump to [Quick start](#quick-start).
+> [Serving LLMs on Kubernetes, in plain English](#serving-llms-on-kubernetes-in-plain-english).
+> Already know the pieces? Jump to [Quick start](#quick-start).
 
 ---
 
@@ -36,17 +36,17 @@ everything else.
 - [Quick start](#quick-start)
 - [Tiers](#tiers)
 - [How deploys work](#how-deploys-work)
-- [Why Argo CD](#why-argo-cd)
 - [Using the model](#using-the-model)
 - [Costs](#costs)
 - [Guardrails](#guardrails)
 - [Serving LLMs on Kubernetes, in plain English](#serving-llms-on-kubernetes-in-plain-english)
 - [Architecture](#architecture)
-- [Setting it up in your own account](#setting-it-up-in-your-own-account)
+- [From EKS to GKE](#from-eks-to-gke)
+- [Setting it up in your own project](#setting-it-up-in-your-own-project)
 - [Layout](#layout)
 - [Commands](#commands)
-- [Lessons learned](#lessons-learned)
 - [Honest caveats](#honest-caveats)
+- [Status](#status)
 
 ---
 
@@ -55,7 +55,7 @@ everything else.
 Everything is driven by one file, [`deploy/config.yaml`](deploy/config.yaml):
 
 ```yaml
-cluster: false   # may CI create the EKS cluster?
+cluster: false   # may CI create the GKE cluster?
 tier: none       # none | sim | small | gpu | kimi — what Argo CD runs on it
 ```
 
@@ -63,18 +63,19 @@ Change it, push it, and CI + Argo CD converge on it. The Makefile wraps the
 edit-commit-push:
 
 ```bash
-make cluster-on            # cluster: true  -> CI builds EKS + Argo CD (~20 min, ~$0.26/hr)
-make tier TIER=kimi        # tier: kimi     -> Argo CD deploys Kimi-Dev-72B
+make cluster-on            # cluster: true  -> CI builds GKE + Argo CD (~15 min, ~$0.09/hr)
+make tier TIER=sim         # tier: sim      -> prove the whole path on a $0.04/hr CPU node
+make tier TIER=gpu         # tier: gpu      -> Qwen3.6-27B on an RTX PRO 6000 (needs GPU quota)
 make follow                # watch CI wait for Argo CD and smoke-test the model
 make kubeconfig            # kubectl access; `make argocd-ui` for the Argo CD UI
 
-make tier TIER=none        # GPUs gone, cluster stays (~$0.26/hr)
+make tier TIER=none        # GPUs gone, cluster stays (~$0.09/hr)
 make cluster-off && make destroy   # everything billable gone (~$0)
 ```
 
 > **Nothing switches it off for you.** A tier keeps its GPU node(s) running
-> until you set `tier: none` or run `make destroy` — Kimi left on is ~$200/day.
-> See [Guardrails](#guardrails).
+> until you set `tier: none` or run `make destroy` — `gpu` at two replicas left
+> on is ~$85/day. See [Guardrails](#guardrails).
 
 **Try it for free first.** `make argocd-local` builds the same stack on a local
 kind cluster — the same Argo CD install and root app, syncing this repo from
@@ -86,42 +87,34 @@ GitHub — against a vLLM simulator. **$0.00.**
 
 Every tier is the same Helm chart (`gitops/apps/model-server`) with a different
 values file in [`gitops/tiers/`](gitops/tiers). Which one runs is the `tier` key
-in [`deploy/config.yaml`](deploy/config.yaml).
+in [`deploy/config.yaml`](deploy/config.yaml). All capacity is **Spot**.
 
-| Tier | Model | Hardware | Capacity | Replicas | ~$/hr while up* |
-|------|-------|----------|----------|----------|------------------|
-| `sim` | [`llm-d-inference-sim`](https://github.com/llm-d/llm-d-inference-sim) (fake vLLM) | `c7i.large` | spot | 1–4 | 0.29 |
-| `small` | `Qwen/Qwen3.5-4B` | `g6.xlarge` — 1× L4, 22 GB | spot | 1–2 | 0.79–1.32 |
-| `gpu` | `Qwen/Qwen3.6-27B-FP8` | `g6e.xlarge` — 1× L40S, 44 GB | spot | 1–2 | 2.06–3.86 |
-| **`kimi`** ⭐ | **`moonshotai/Kimi-Dev-72B`** | **`g7e.12xlarge` — 2× RTX PRO 6000, 192 GB** | **on-demand** | **1** | **8.68** |
-| `none` | — | — | — | 0 | 0.26 (cluster only) |
+| Tier | Model | Machine | GPU quota | Replicas | ~$/hr while up* |
+|------|-------|---------|-----------|----------|------------------|
+| `sim` | [`llm-d-inference-sim`](https://github.com/llm-d/llm-d-inference-sim) (fake vLLM) | `e2-standard-2` | none | 1–4 | 0.16 |
+| `small` | `Qwen/Qwen3.5-4B` | `g2-standard-4` — 1× L4, 24 GB | 1 L4 / replica | 1–2 | 0.56–1.00 |
+| **`gpu`** ⭐ | **`Qwen/Qwen3.6-27B-FP8`** | **`g4-standard-48` — 1× RTX PRO 6000, 96 GB** | **1 RTX PRO 6000 / replica** | **1–2** | **1.86–3.60** |
+| `kimi` | `moonshotai/Kimi-Dev-72B` | `g4-standard-96` — 2× RTX PRO 6000, 192 GB | 2 RTX PRO 6000 | 1 | 3.60 |
+| `none` | — | — | — | 0 | 0.09 (cluster only) |
 
-\* Including the ~$0.26/hr the cluster costs whenever it exists. Spot prices move;
-re-measure with `make prices`.
+\* Including the ~$0.09/hr system node, the two load balancers a running tier
+adds (~$0.025/hr together), boot disks and node IPs. us-central1 list prices, measured with `make prices`;
+GCP Spot prices change at most monthly.
 
-**Why these shapes:** the account's GPU quota in `us-west-2` is **64 vCPU
-on-demand** and **8 vCPU spot** (G and VT family). Spot fits two 4-vCPU
-single-GPU nodes, which is what `small` and `gpu` use to demo scale-out 1→2.
-`kimi` needs a 48-vCPU node; that only fits the on-demand quota, and only once —
-so it is a fixed single replica.
+**Why these shapes.** The lab is sized around **two Spot `g4-standard-48`
+nodes** — one RTX PRO 6000 Blackwell (96 GB) each — so the `gpu` tier can show
+real 1→2 scale-out for about $3.60/hr at peak. 96 GB holds a 27B FP8 model with
+~60 GB to spare for KV cache, so one card serves long contexts and real
+concurrency. `kimi` puts both cards in one `g4-standard-96` for a BF16 72B
+model. `small` is the cheap path on an L4, which many projects get quota for
+first.
 
 **About Kimi-Dev-72B:** a 72.7B coding model (Qwen2.5-72B base, MIT licence,
-ungated). It ships BF16 only — 145 GB of weights, ~135 GiB in VRAM — so it runs
-**tensor-parallel across two 96 GB GPUs**, leaving ~34 GiB for KV cache
-(~110k tokens: three full 32k-context conversations, or many short ones). It
-reasons in a `◁think▷` block before answering, so give it a generous
-`max_tokens`. The larger Kimi K2/K3 models (1T+ parameters) do not fit any
-single AWS G-family instance.
-
-Measured on the first deploy:
-
-| | |
-|---|---|
-| GPU node launch → Ready | ~2 min |
-| Weights download (145 GB, gp3 at 1000 MB/s) | ~6 min (~370 MB/s) |
-| Load + CUDA graph capture | ~4 min |
-| **Cold start total** | **~12–15 min** |
-| Single-request decode speed | ~18 tokens/s |
+ungated). BF16 only — 145 GB of weights, ~135 GiB in VRAM — so it runs
+**tensor-parallel across two 96 GB GPUs**, leaving ~34 GiB of KV cache
+(~110k tokens). It reasons in a `◁think▷` block before answering, so give it a
+generous `max_tokens`. The same model on the same GPU pair was measured on AWS
+(g7e.12xlarge) at a ~12–15 minute cold start and ~18 tokens/s single-stream.
 
 ---
 
@@ -134,7 +127,7 @@ push to main
    │
    ├─ terraform/10-cluster/** or deploy/config.yaml changed
    │     └─ CI: terraform plan → apply only if non-empty        (never while cluster: false)
-   │        EKS, VPC, IAM, Karpenter, KEDA, Prometheus, Argo CD + the root Application
+   │        VPC, GKE, node auto-provisioning limits, KEDA, Prometheus, Argo CD + root Application
    │
    └─ gitops/** or deploy/** changed
          └─ Argo CD notices the commit and syncs the cluster to it
@@ -144,59 +137,36 @@ push to main
 
 - **No pointless applies.** Terraform runs only for infra changes and applies
   only non-empty plans. Docs and README pushes trigger nothing.
-- **No accidental spend.** While `cluster: false`, CI creates nothing — no push
-  can start the $0.26/hr base cost by mistake.
+- **No accidental spend.** While `cluster: false`, CI creates nothing.
 - **Drift is impossible to keep.** Argo CD self-heals: a `kubectl edit` on the
   cluster is reverted to what git says.
 - **One at a time.** Deploy and destroy share a concurrency group.
-- **Credentials.** GitHub Actions assumes IAM roles via OIDC (no stored AWS
-  keys). Argo CD pulls the public repo and needs no credentials at all.
+- **No keys.** GitHub Actions exchanges its OIDC token for a short-lived
+  token of a deploy service account through **Workload Identity Federation**.
+  The provider admits only this repository on `main`, so a pull request can
+  neither deploy nor read state. Argo CD pulls the public repo with no
+  credentials at all.
+- **Least privilege.** The deploy service account can run GKE and the network
+  (`container.admin`, `compute.networkAdmin`, `compute.securityAdmin`, read-only
+  `compute.viewer`) and use one node service account. It cannot grant IAM,
+  create service accounts or touch billing, so a compromised workflow cannot
+  escalate to project owner.
 
-`make cluster-apply-local` is the only local apply and requires
-`ALLOW_LOCAL=1` (break-glass). `00-bootstrap` is applied by hand because it
-creates the role CI uses.
+Terraform and Argo CD split along one line: anything that needs GCP identities
+or values that must not be in git (the IP allowlist, the HuggingFace token)
+stays in Terraform, which hands them to Argo CD as the root Application's
+`valuesObject` and a Kubernetes Secret. Everything else is plain Kubernetes in
+git, where self-heal, pruning and the Argo CD UI earn their keep.
 
----
-
-## Why Argo CD
-
-The first version applied the inference layer with Terraform from CI. It worked,
-but most of its failures came from Terraform waiting on Kubernetes: a 10-minute
-rollout deadline while a 145 GB model was still loading, an orphaned Deployment
-blocking a re-apply, a 50-minute rollout wait holding the state lock. Splitting
-the responsibilities fixes that class of problem:
-
-| | Terraform + GitHub Actions | Argo CD |
-|---|---|---|
-| Owns | VPC, EKS, IAM, access entries, Karpenter controller, KEDA, Prometheus, Argo CD itself | llm-d router, model server, NodePool + EC2NodeClass, ScaledObject, public Services, Open WebUI, NVIDIA plugin |
-| Changes | rarely | constantly |
-| How | push → plan → apply | push → Argo CD syncs (asynchronously) |
-| Why | needs AWS identities and values that must not be in git | pure Kubernetes; benefits from self-heal, pruning and a UI |
-
-How the hard parts were solved:
-
-- **Secrets and private values never enter git.** Terraform writes them where
-  Argo CD can use them: the HuggingFace token as a Kubernetes Secret, and the
-  IP allowlist plus the Karpenter node IAM role as `valuesObject` on the root
-  Application it creates. The repo is public; none of these are in it.
-- **Switching off goes through git too.** Deleting resources by hand would
-  just be undone by Argo CD, so `tier: none` is committed and Argo CD prunes
-  the inference layer; deleting the NodePool makes Karpenter return the nodes.
-- **Teardown cascades.** Every Application carries Argo CD's resources
-  finalizer, so deleting the root app removes the NodePools (Karpenter
-  terminates the nodes) and the Services (EKS deletes the NLBs) before
-  Terraform removes the cluster.
-- **Argo CD doesn't fight the autoscaler.** The model Deployment sets no
-  `replicas` and its Application ignores `/spec/replicas`; KEDA's HPA owns it.
-- **Synchronous feedback kept.** CI's verify job waits for Argo CD to report
-  every app Synced + Healthy and smoke-tests the model, so a push still ends in
-  a green or red check.
+`make cluster-apply-local` is the only local apply of the cluster layer and
+requires `ALLOW_LOCAL=1` (break-glass). `00-bootstrap` is applied by hand
+because it creates the identity CI uses.
 
 ---
 
 ## Using the model
 
-**Open WebUI** — a ChatGPT-style interface on its own load balancer. Its URL is
+**Open WebUI** — a ChatGPT-style interface on its own load balancer. Its IP is
 in the deploy run's summary, or:
 
 ```bash
@@ -209,9 +179,9 @@ persisted (no volume), so a pod restart or `tier: none` wipes them.
 **OpenAI-compatible API** — the router's public endpoint, same IP allowlist:
 
 ```bash
-EP=$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+EP=$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 curl -s http://$EP/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "moonshotai/Kimi-Dev-72B",
+  "model": "Qwen/Qwen3.6-27B-FP8",
   "messages": [{"role": "user", "content": "Write a palindrome checker in Python."}],
   "max_tokens": 800
 }' | jq -r '.choices[0].message.content'
@@ -230,51 +200,60 @@ make apps             # same, in the terminal
 **On the free kind stack** the router is at `http://localhost:18080` and Open
 WebUI at `http://localhost:18081`.
 
-**Logs:**
+**Logs and live state:**
 
 ```bash
 kubectl -n llm-d logs -f deploy/llm-d-vllm-decode     # vLLM: download, load, requests
 kubectl -n llm-d logs -f deploy/llm-d-epp -c epp      # router: which backend got each request
-kubectl -n kube-system logs -f deploy/karpenter       # node launches and terminations
-make watch                                            # pods, HPA, nodes at a glance
+kubectl get events -A --field-selector reason=TriggeredScaleUp   # GKE adding a node
+make watch                                            # pods, HPA, ComputeClasses, nodes
 ```
 
 ---
 
 ## Costs
 
-Measured in `us-west-2`, November 2026.
+us-central1 list prices (USD), November 2026, from the Cloud Billing catalog
+(`make prices`). Full analysis, including alternatives such as Cloud Run GPUs
+and Vertex AI, in [`docs/COSTS.md`](docs/COSTS.md).
 
-**Whenever the cluster exists — ~$0.26/hr (~$6.20/day):**
+**Whenever the cluster exists — ~$0.09/hr (~$2.20/day):**
 
 | Item | $/hr |
 |------|------|
-| EKS control plane | 0.100 |
-| 2× `t3.xlarge` spot system nodes | ~0.102 |
-| Public IPv4 addresses (~6 × $0.005) | ~0.030 |
-| Network Load Balancers (router + WebUI) | ~0.045 |
-| System node EBS | ~0.004 |
+| GKE management fee | 0.10, **credited** — the free tier covers one zonal cluster per billing account |
+| 1× `e2-standard-4` Spot system node | ~0.080 |
+| System node disk (50 GB pd-balanced) | ~0.007 |
+| System node external IP (Spot rate) | ~0.003 |
 
-**Added while `kimi` runs — ~$8.42/hr:** `g7e.12xlarge` on-demand $8.29, plus
-the 400 GB high-throughput gp3 root volume (~$0.13). The same instance is ~$5.46
-on spot, but this account's 8-vCPU spot quota cannot hold a 48-vCPU node.
+**Added while a tier runs:**
+
+| Tier | Per node (machine + boot disk + IP) | Load balancers | Total added |
+|------|-------|----------------|-------------|
+| `sim` | 0.040 + 0.006 + 0.003 | ~0.025 | ~0.07 |
+| `small` | 0.423 + 0.014 + 0.003, per replica | ~0.025 | ~0.47–0.91 |
+| `gpu` | 1.718 + 0.022 (200 GB Hyperdisk) + 0.003, per replica | ~0.025 | ~1.77–3.51 |
+| `kimi` | 3.436 + 0.044 (400 GB Hyperdisk) + 0.003 | ~0.025 | ~3.51 |
+
+Load balancers: the first five forwarding rules in a region cost $0.025/hr
+together; a running tier uses two.
 
 | Scenario | Cost |
 |----------|------|
-| 2-hour Kimi session | ~$17.50 |
-| Cluster idling, no GPU | ~$6.20/day |
-| `make destroy` | ~$0 (S3 state only) |
+| 2-hour `gpu` session, one replica | ~$3.70 |
+| 2-hour `kimi` session | ~$7.20 |
+| Cluster idling, no GPU | ~$2.20/day |
+| `make destroy` | ~$0 (empty project + a few KB of state) |
 
 **Where money leaks, and what this repo does about it:**
 
 | Leak | Naive cost | Here |
 |------|-----------|------|
-| NAT Gateway (3 AZ) | $0.135/hr + $0.045/GB | **none** — public subnets + IGW; a 145 GB model download costs $0 in transfer |
-| Forgotten GPU node | $200/day (Kimi) | `make tier TIER=none` + budget alert — nothing turns it off automatically |
-| EKS control plane left up | $73/month | `make destroy` (CI) |
-
-`make cost` shows actual spend attributed by the `Project` tag. Older model/shape
-analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
+| Cloud NAT | per-VM-hour + $0.045/GB processed — a 145 GB model is ~$6.50 per cold start | **none** — nodes egress directly; GCP ingress is free |
+| Regional control plane | $0.10/hr | **zonal**, inside the free tier |
+| Forgotten GPU node | ~$42–84/day | `tier: none`, budget email, nothing automatic |
+| On-demand fallback when Spot is out | 2.6× the Spot price | ComputeClass `whenUnsatisfiable: DoNotScaleUp` waits instead |
+| Managed Prometheus / workload logs | per sample / per GB | off; in-cluster Prometheus, system logs only |
 
 ---
 
@@ -285,26 +264,30 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
 > replica (`minReplicas: 1`), so its GPU node runs until you turn it off. End
 > every session with `make tier TIER=none` (or `make destroy`).
 
-- **`tier: none`** (`make tier TIER=none`) — Argo CD prunes the inference
-  layer; deleting the NodePool makes Karpenter terminate its nodes. The
-  cluster stays (~$0.26/hr). CI's verify job fails if any NodePool remains.
-- **Karpenter consolidation** — a GPU node is terminated about a minute after
-  its last model pod leaves.
-- **NodePool vCPU limits** match the quota, so an over-ask shows up as a
-  Pending pod rather than a stream of EC2 errors.
+- **`tier: none`** — Argo CD prunes the inference layer, including the tier's
+  ComputeClass; GKE drains and deletes the nodes two minutes after they empty.
+  The cluster stays (~$0.09/hr). CI's verify job fails if a lab ComputeClass
+  remains.
+- **A hard ceiling in Terraform.** Node auto-provisioning `resource_limits`
+  cap the whole cluster at 120 vCPU, 420 GB and **2 RTX PRO 6000 + 2 L4**. No
+  tier, autoscaler or bug can launch more; a GPU type not listed can never be
+  launched at all.
+- **Spot only, no silent upgrade to on-demand.** Each ComputeClass lists Spot
+  shapes only and waits when none is available.
 - **Destroy on demand** (`.github/workflows/destroy.yml`, `make destroy`) —
-  deletes the root Argo CD app (cascading to NodePools and NLBs), waits for the
-  NLBs and GPU nodes to go, destroys the cluster, sweeps leaked network
-  interfaces and orphaned instances, and fails if anything billable remains.
-  Leaves only the S3 state bucket and the OIDC deploy role. Run `make cluster-off` first
-  so the next push can't rebuild it.
+  deletes the root Argo CD app (cascading to ComputeClasses and load
+  balancers), waits for GKE to remove the forwarding rules, destroys the
+  cluster and VPC, sweeps any leaked `k8s-*` firewall rules, and fails if any
+  cluster, VM, disk, forwarding rule, reserved IP or lab VPC remains. Run
+  `make cluster-off` first so the next push can't rebuild it.
 - **`cluster: false` gate** — CI never creates the cluster unless git says so.
-- **AWS Budget + email** — set the `BUDGET_ALERT_EMAIL` secret to enable. It
-  tells you after the money is spent; it does not stop anything.
-- **`make whats-running`** — lists anything billable still up in the region.
+- **Budget** — `00-bootstrap` sets a monthly budget on the project with emails
+  at 50% and 90% actual and 100% forecast. It reports; it does not stop
+  anything.
+- **The project is the blast radius.** Everything lives in one dedicated
+  project; `make whats-running` lists anything billable in it.
 - **IP allowlist** on both public endpoints (`ALLOWED_CIDRS`); the chart refuses
-  to render internet-facing Services on EKS if the list is empty.
-- **Tagging** — every resource carries `Project=llm-d-eks-lab`.
+  to render internet-facing Services on GKE if the list is empty.
 
 ---
 
@@ -316,7 +299,7 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
 
 Three things break the usual Kubernetes playbook:
 
-1. **The model has to fit in GPU memory.** Weights live in VRAM, not RAM. Rule of thumb: about 1 byte per parameter at FP8, 2 at BF16. A 72B model in BF16 is roughly 145 GB. No single GPU holds that, so it gets split across two.
+1. **The model has to fit in GPU memory.** Weights live in VRAM, not RAM. Rule of thumb: about 1 byte per parameter at FP8, 2 at BF16. A 72B model in BF16 is roughly 145 GB. No single GPU here holds that, so it gets split across two.
 2. **GPU utilization lies.** A GPU doing inference reads about 100% busy whether it is keeping up or hopelessly behind. CPU-style autoscaling cannot tell the difference.
 3. **Requests have memory.** While generating, the model keeps notes on the conversation in VRAM. That is the **KV cache**. Send the next message to a different pod and the notes are gone - it has to re-read the whole conversation.
 
@@ -330,7 +313,7 @@ Think of a busy restaurant. Customers queue at the door. A **host** decides whic
 |---|---|---|
 | **llm-d router** (EPP) | host | which pod gets this request |
 | **KEDA** | manager | how many pods |
-| **Karpenter** | staffing agency | how many GPU nodes |
+| **GKE node auto-provisioning** (ComputeClass) | staffing agency | how many GPU nodes |
 | **vLLM** | the kitchen | actually runs the model |
 
 Three of those sound alike. They are not. Mixing them up is the most common confusion.
@@ -364,31 +347,31 @@ Nothing waiting: you are keeping up. Something waiting: add capacity. The whole 
 
 1. Requests pile up. KEDA adds a pod.
 2. No free GPU, so the pod sits **Pending**.
-3. Karpenter sees it, reads what it asked for, and launches a matching GPU node.
+3. The pod names a ComputeClass; GKE reads its priorities and creates a Spot GPU node pool that fits.
 4. Traffic stops. Replicas drop. The node is empty.
-5. About a minute later, Karpenter gives it back.
+5. Two minutes later, GKE deletes it.
 
 Idle GPU cost is zero. That is the whole point.
 
 ### The VRAM math
 
 ```
- +------------------ 2 x 96 GB GPU -------------------+
- |  weights ~135 GiB (split)      |  KV cache ~34 GiB  |
- +--------------------------------+--------------------+
-        fixed cost                  how many people fit
+ +------------------ 1 x 96 GB GPU -------------------+
+ |  weights ~29 GB   |        KV cache ~60 GB          |
+ +-------------------+---------------------------------+
+     fixed cost            how many people fit
 ```
 
-Weights are a fixed cost. What is left over is KV cache, and KV cache is how many conversations fit at once. Squeeze it and requests queue - which is why queue depth is the right signal. For Kimi-Dev-72B on two 96 GB GPUs that is about 110,000 tokens of cache: roughly three full 32k conversations at the same time.
+Weights are a fixed cost. What is left over is KV cache, and KV cache is how many conversations fit at once. Squeeze it and requests queue - which is why queue depth is the right signal. A 27B FP8 model on one 96 GB card leaves about 60 GB for cache; a 72B BF16 model across two leaves about 34 GiB.
 
 ### The whole thing in four lines
 
 - An LLM needs its weights in VRAM, a KV cache per conversation, and a GPU that reads 100% busy either way.
 - llm-d puts a router in front that picks the pod by queue, cache use and prefix hits.
-- KEDA scales pods on queue depth. Karpenter buys GPU nodes for pending pods and returns them when empty.
-- Keep it all in git and it costs about $8 an hour while you use it, nothing after.
+- KEDA scales pods on queue depth. GKE buys Spot GPU nodes for pending pods and returns them when empty.
+- Keep it all in git and it costs about $2 an hour while you use it, nothing after.
 
-The mental model that stuck: **llm-d is a load balancer that knows what is in each GPU's memory.** The sharp edges I hit along the way are in [Lessons learned](#lessons-learned).
+The mental model that stuck: **llm-d is a load balancer that knows what is in each GPU's memory.**
 
 ### Jargon decoder
 
@@ -397,11 +380,11 @@ The mental model that stuck: **llm-d is a load balancer that knows what is in ea
 | **VRAM** | Memory on the GPU. Decides which models fit. |
 | **FP8 / BF16** | 1 vs 2 bytes per weight. FP8 halves memory for a small quality cost. |
 | **TP / tensor parallelism** | Splitting one model across several GPUs. Kimi uses TP=2. |
-| **quota** | AWS's cap on what you may launch, counted in **vCPUs**. Starts at zero for GPUs. |
-| **spot / on-demand** | Spot is discounted spare capacity AWS can reclaim with 2 minutes' notice; on-demand is full price and stable. |
-| **OIDC** | Lets GitHub Actions prove its identity to AWS and get short-lived credentials — no stored keys. |
-| **NLB** | Network Load Balancer — the public entry point for a Service. |
-| **IGW / NAT** | Ways out to the internet; the IGW is free, a NAT Gateway is not. |
+| **quota** | Google's cap on what a project may launch, per GPU family, per region and globally. Starts at zero for most GPUs. |
+| **Spot** | Discounted spare capacity Google can reclaim with 30 seconds' notice; 60–90% cheaper than on-demand. |
+| **ComputeClass** | A GKE object listing the machine shapes a workload may use, in order of preference. GKE's answer to a Karpenter NodePool. |
+| **Workload Identity Federation** | Lets GitHub Actions prove its identity to Google and get short-lived credentials — no stored keys. |
+| **Cloud NAT** | A managed way out to the internet for nodes without public IPs. Bills per GB; not used here. |
 
 ---
 
@@ -410,115 +393,153 @@ The mental model that stuck: **llm-d is a load balancer that knows what is in ea
 ```
                          Internet (ALLOWED_CIDRS only)
                      │                              │
-              NLB :80 (API)                  NLB :80 (Open WebUI)
+        passthrough NLB :80 (API)        passthrough NLB :80 (Open WebUI)
                      │                              │
         ┌────────────▼─────────────┐   ┌────────────▼──────────┐
         │ llm-d router v1.0.0      │◀──│ Open WebUI            │
-        │ Envoy + Endpoint Picker  │   │ (system nodes)        │
+        │ Envoy + Endpoint Picker  │   │ (system pool)         │
         └────────────┬─────────────┘   └───────────────────────┘
                      │  picks a backend: queue, KV-cache and prefix aware
         ┌────────────▼─────────────┐
         │ vLLM 0.30 model server   │◀── KEDA: replicas from EPP queue depth
         │ (or llm-d-inference-sim) │      (Prometheus → ScaledObject → HPA)
         └────────────┬─────────────┘
-                     │
+                     │ nodeSelector cloud.google.com/compute-class
         ┌────────────▼─────────────┐
-        │ Karpenter NodePool       │◀── launches GPU nodes for Pending pods,
-        │ per tier, GPU-tainted    │    terminates them when empty
-        └──────────────────────────┘
+        │ ComputeClass per tier    │◀── GKE creates a Spot node pool for Pending
+        │ Spot GPU shapes only     │    pods, deletes it when empty; capped by
+        └──────────────────────────┘    the cluster's resource_limits
 ```
 
+- **GKE Standard, zonal control plane** in `us-central1-b`, free under the GKE
+  free tier. Node pools may use `us-central1-b/c/f`, all of which offer G4;
+  L4 is in b and c. Three zones triples the chance of finding Spot capacity.
+- **Standard, not Autopilot.** Autopilot bills per pod request with a GPU
+  premium and hides the nodes; this lab is about watching nodes come and go.
+- **One always-on system pool** (Spot `e2-standard-4`, 1–3 nodes) for Argo CD,
+  KEDA, Prometheus, the router and Open WebUI, so GPU nodes can scale to zero
+  without taking the platform with them.
+- **GPU drivers and the device plugin are GKE's job.** The ComputeClass asks
+  for `driverVersion: latest`; nothing NVIDIA is installed by hand.
 - **Standalone router mode.** The llm-d router runs its own Envoy sidecar and
   is exposed by a plain LoadBalancer Service, so no Gateway API dataplane is
-  needed. Istio is installed only if `enable_istio = true` (off by default).
-- **No AWS Load Balancer Controller.** Services use the
-  `aws-load-balancer-type: nlb` annotation, which the controller built into EKS
-  handles.
-- **No NAT Gateway.** Nodes sit in public subnets behind security groups;
-  model downloads go straight out the IGW.
-- **NVIDIA device plugin** is an Argo CD app on the GPU tiers: the EKS AL2023
-  NVIDIA AMI ships the driver but not the plugin.
-- **App of apps.** Terraform creates one Argo CD Application, `root`, pointing
-  at `gitops/root`. It reads `tier` from `deploy/config.yaml` and renders one
-  child Application per component; `tier: none` renders none, so Argo CD prunes
-  them all.
-- **Access.** Cluster admins are explicit EKS access entries — the human admin
-  and the CI deploy role — rather than "whoever ran Terraform."
+  needed. GKE's managed Gateway API is disabled so the v1.6.2 CRDs llm-d tests
+  against are the ones installed. Istio is behind `enable_istio` (off).
+- **No NAT.** Nodes have external IPs and egress directly; the VPC firewall is
+  the boundary.
+- **App of apps.** Terraform creates one Argo CD Application, `root` (through
+  Argo's `argocd-apps` chart), pointing at `gitops/root`. It reads `tier` from
+  `deploy/config.yaml` and renders one child Application per component;
+  `tier: none` renders none, so Argo CD prunes them all.
+- **Kubernetes auth without plugins.** Terraform's providers use the caller's
+  own short-lived Google access token; CI uses `get-gke-credentials`, which
+  writes a token-based kubeconfig. Nothing long-lived lands in state.
 
 ### Pinned versions
 
 | Component | Version |
 |-----------|---------|
-| EKS | 1.37 |
+| GKE | REGULAR release channel |
 | llm-d router chart (`llm-d-router-standalone`) + EPP | v1.0.0 |
 | vLLM image | `vllm/vllm-openai:v0.30.0` |
 | `llm-d-inference-sim` | v1.0.0 |
 | Gateway API / Inference Extension CRDs | v1.6.2 / v1.6.2 |
-| Karpenter | 1.15.1 |
 | KEDA | 2.21.0 |
 | kube-prometheus-stack | 92.16.0 |
-| NVIDIA device plugin | 0.20.1 |
 | Open WebUI chart | 18.3.0 |
-| Argo CD chart | 10.18.0 (Argo CD v3.6.1) |
+| Argo CD chart / argocd-apps chart | 10.18.0 (Argo CD v3.6.1) / 2.0.8 |
+| Terraform / google provider | 1.13 / 7.x |
 
 The `validate` workflow checks that pinned charts and CRD URLs still resolve,
 and renders every GitOps chart for every tier and environment through strict
-schema validation (Kubernetes + Karpenter/KEDA/Argo CD CRDs).
+schema validation (Kubernetes + ComputeClass/KEDA/Argo CD CRDs).
 
 ---
 
-## Setting it up in your own account
+## From EKS to GKE
 
-You need Terraform ≥ 1.13, the AWS CLI v2, `kubectl`, `helm` and the `gh` CLI.
-`kind` + Docker for the free local tier; `k6` for `make load` (falls back to a
-container).
+This repo is a port of [llm-d-eks-lab](https://github.com/didiberman/llm-d-eks-lab).
+The GitOps design, the tiers and the safety rails carried over; the cloud
+pieces map like this:
 
-**1. GPU quota.** In your chosen region (default `us-west-2`), request
-*Running On-Demand G and VT instances* (`L-DB2E81BA`) and/or *All G and VT Spot
-Instance Requests* (`L-3819A6DF`). Both are counted in **vCPUs** and start at
-zero. `kimi` needs 48 on-demand; `small`/`gpu` need 4 spot per replica. Check
-with `make quota`.
+| EKS | GKE |
+|-----|-----|
+| Karpenter controller | node auto-provisioning (`cluster_autoscaling` in Terraform) |
+| NodePool + EC2NodeClass | ComputeClass (one per tier, from Argo CD) |
+| NodePool `limits.cpu` | cluster-wide `resource_limits` incl. per-GPU-type caps |
+| `consolidateAfter: 1m` | `autoscalingPolicy.consolidationDelayMinutes: 2` + `OPTIMIZE_UTILIZATION` |
+| NVIDIA device plugin app | built in; `gpu.driverVersion: latest` |
+| IAM role via GitHub OIDC | Workload Identity Federation → service account |
+| EKS access entries | IAM roles on the project (`container.admin`) |
+| NLB via annotation | plain `type: LoadBalancer` (external passthrough NLB) |
+| Public subnets + IGW | external node IPs, no Cloud NAT |
+| S3 state bucket | GCS state bucket (native locking) |
+| vCPU-denominated G/VT quota | per-GPU-family + global GPU quota, plus CPUs |
+| $0.10/hr control plane | $0 (free tier: one zonal cluster) |
 
-**2. Bootstrap — the only layer applied from your machine**, because it creates
-the role CI uses. Create `terraform/00-bootstrap/terraform.tfvars`:
+One lesson carried over in money: on AWS, nodes in public subnets pulling 241 GB
+of weights and images through their public IPs cost **$2.41 of
+"PublicIP-In" regional data transfer** on a $10 bill. Google does not charge for
+ingress, so the same pattern costs nothing here.
+
+---
+
+## Setting it up in your own project
+
+You need Terraform ≥ 1.13, the gcloud CLI (with `gke-gcloud-auth-plugin` for
+`make kubeconfig`), `kubectl`, `helm` and the `gh` CLI. `kind` + Docker for the
+free local tier; `k6` for `make load` (falls back to a container).
+
+**1. Bootstrap — the only layer applied from your machine**, because it creates
+the project and the identity CI uses. Log in with `gcloud auth
+application-default login`, then create `terraform/00-bootstrap/terraform.tfvars`
+(gitignored):
 
 ```hcl
-github_repo = "<owner>/<repo>"
-# If the account already has the GitHub OIDC provider from another project:
-# create_github_oidc_provider = false
-# If the repo uses immutable OIDC subjects, set the prefix from
-#   gh api repos/<owner>/<repo>/actions/oidc/customization/sub
-# github_oidc_sub_prefix = "repo:<owner>@<id>/<repo>@<id>"
+project_id          = "<globally-unique-id>"   # default gke-llm-lab-01
+billing_account     = "XXXXXX-XXXXXX-XXXXXX"   # a paid account; free trials get no GPUs
+budget_currency     = "USD"                    # must match the billing account
+quota_contact_email = "you@example.com"
+github_repo         = "<owner>/<repo>"         # creates the WIF pool + deploy SA
 ```
 
-On a brand-new account the state bucket does not exist yet: comment out the
-`backend "s3"` block in `terraform/00-bootstrap/versions.tf`, run
-`make bootstrap`, restore the block, then run `terraform init -migrate-state`
-in that directory. After that, `make bootstrap` works directly.
+On a brand-new project the state bucket does not exist yet: move
+`terraform/00-bootstrap/backend.tf` aside, run `make bootstrap`, restore it, run
+`terraform init -migrate-state` in that directory, and confirm the migration
+succeeded before deleting the local `terraform.tfstate`. After that,
+`make bootstrap` works directly. If your project ID differs, update the bucket
+in `backend.tf` and `PROJECT_ID` in the Makefile, and set the repo variable
+below.
 
-**3. Repo settings** (values from the bootstrap outputs):
+**2. GPU quota.** Bootstrap files the requests (2 RTX PRO 6000, 2 L4, 128
+vCPU) as Cloud Quotas preferences. Google decides; a brand-new project is often
+refused and asked to build some billing history first. `make quota` shows what
+was granted. `sim` needs no GPU quota at all.
+
+**3. Repo settings.** `make github-setup` writes them from the bootstrap
+outputs (it uses your current IP for `ALLOWED_CIDRS` unless you pass one):
 
 | Kind | Name | Value |
 |------|------|-------|
-| secret | `AWS_DEPLOY_ROLE_ARN` | `github_deploy_role_arn` |
+| variable | `GCP_PROJECT_ID` | `project_id` |
+| secret | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `workload_identity_provider` |
+| secret | `GCP_DEPLOY_SERVICE_ACCOUNT` | `deploy_service_account` |
 | secret | `ALLOWED_CIDRS` | e.g. `["203.0.113.7/32"]` — who may reach the endpoints |
 | secret | `HF_TOKEN` | optional; faster HuggingFace downloads |
-| secret | `BUDGET_ALERT_EMAIL` | optional; enables the budget alert |
-| variable | `STATE_BUCKET` | `state_bucket` |
-| variable | `ADMIN_PRINCIPAL_ARN` | your IAM user/role ARN, for `kubectl` |
 
-`ALLOWED_CIDRS` is a secret rather than a variable so your IP is masked in
-Actions logs, which are public on a public repo.
+`ALLOWED_CIDRS` and the provider name are secrets rather than variables so your
+IP and project number are masked in Actions logs, which are public on a public
+repo.
 
-**4. Deploy.** `make cluster-on` (CI builds EKS and Argo CD, ~20 min), then
+**4. Deploy.** `make cluster-on` (CI builds GKE and Argo CD, ~15 min), then
 `make tier TIER=sim` to prove the path for pennies, then the tier you want.
 If you fork the repo, set `gitops_repo_url` in `terraform/10-cluster/variables.tf`
 and `repoURL` in `gitops/root/values.yaml` to your fork — Argo CD must read the
 repo without credentials, so it has to be public.
 
-**5. Protect `main`.** The deploy role has AdministratorAccess and trusts only
-workflows running on `main`, so whoever can push to `main` controls the AWS
-account. Block force-pushes and require reviews from anyone but you.
+**5. Protect `main`.** Workload Identity admits only workflows on `main`, and
+Argo CD auto-syncs `main`, so whoever can push to `main` controls the cluster.
+Block force-pushes and require reviews from anyone but you.
 
 ---
 
@@ -527,20 +548,21 @@ account. Block force-pushes and require reviews from anyone but you.
 ```
 deploy/config.yaml        the switch: cluster true|false, tier none|sim|small|gpu|kimi
 terraform/
-  00-bootstrap/           S3 state bucket, GitHub OIDC deploy role             (local, once)
-  10-cluster/             VPC (no NAT), EKS, Karpenter, KEDA, Prometheus,      (CI)
-                          Argo CD, root Application, HF token Secret, budget
+  00-bootstrap/           project + billing, APIs, GCS state bucket, node SA,        (local, once)
+                          quota requests, budget, Workload Identity + deploy SA
+  10-cluster/             VPC (no NAT), GKE + auto-provisioning limits, system pool, (CI)
+                          KEDA, Prometheus, CRDs, Argo CD, root Application, HF Secret
 gitops/                   everything Argo CD reconciles
   root/                   app of apps: one Application per component
-  apps/model-server/      EC2NodeClass, NodePool, model Deployment, ScaledObject, Services
+  apps/model-server/      ComputeClass, model Deployment, ScaledObject, Services
   tiers/*.yaml            sim | small | gpu | kimi — the only difference between tiers
-  values/                 values for the upstream charts (llm-d router, Open WebUI, NVIDIA)
+  values/                 values for the upstream charts (llm-d router, Open WebUI)
   bootstrap/              Argo CD install values (shared by Terraform and kind)
 local/                    free kind proof: `make argocd-local`
-scripts/                  render-check (CI), wait-for-apps (CI + local), prices
+scripts/                  render-check (CI), wait-for-apps (CI + local), sweep-k8s-lb (destroy), prices
 loadgen/                  k6 ramp script for `make load`
 .github/workflows/        deploy · destroy · validate
-docs/COSTS.md             shape/price analysis
+docs/COSTS.md             prices, tier costs, and the alternatives to running your own cluster
 ```
 
 ---
@@ -548,16 +570,16 @@ docs/COSTS.md             shape/price analysis
 ## Commands
 
 ```
-make cluster-on / cluster-off   allow / forbid CI to create the EKS cluster (commit + push)
+make cluster-on / cluster-off   allow / forbid CI to create the GKE cluster (commit + push)
 make tier TIER=...              set the tier Argo CD runs (commit + push)
 make follow                     follow the latest deploy run
 make deploy                     re-run the deploy workflow (reconcile + verify)
 make destroy                    destroy workflow: everything billable, to ~$0
 
-make kubeconfig                 kubectl access (context: llm-d-eks-lab)
+make kubeconfig                 kubectl access (context: llm-d-gke-lab)
 make argocd-ui                  Argo CD UI on http://localhost:8090
 make apps                       Argo CD application status
-make watch                      live view of ScaledObject, HPA, pods and nodes
+make watch                      live view of ScaledObject, HPA, pods, ComputeClasses and nodes
 make load                       fire k6 at the endpoint and watch replicas scale
 
 make argocd-local               the whole GitOps stack on kind, $0 (argocd-local-down to remove)
@@ -566,39 +588,9 @@ make render                     render + schema-validate every chart/tier, no cl
 make quota | cost | prices | whats-running
 make validate                   terraform validate + render
 make bootstrap                  apply 00-bootstrap (the one local apply)
+make github-setup               write the Actions variable + secrets from bootstrap outputs
+make cluster-plan               read-only plan of 10-cluster from your machine
 ```
-
----
-
-## Lessons learned
-
-Things the first real deploy surfaced that `terraform validate` could not:
-
-- **Karpenter reserves `karpenter.sh/*` tags.** Setting one on an EC2NodeClass
-  gets the whole object rejected — no NodePool, a pod Pending forever, and
-  Terraform waiting on the rollout until it times out.
-- **Kubernetes gives a Deployment 10 minutes by default** (`progressDeadlineSeconds`)
-  before marking it failed. A 145 GB model needs longer, so the deadline is now
-  derived from the startup-probe window.
-- **AWS Load Balancer Controller annotations do nothing without the controller.**
-  `aws-load-balancer-type: external` tells the built-in controller to stand
-  aside; with nothing else installed the Service never gets an address.
-- **GitHub immutable OIDC subjects** (`repo:owner@id/repo@id:…`) break trust
-  policies written for `repo:owner/repo:…` — every assume fails with "Not
-  authorized." A scheduled workflow failed silently for two weeks because of it.
-- **The EKS AL2023 NVIDIA AMI has no device plugin.** Without it, GPU nodes
-  never advertise `nvidia.com/gpu`.
-- **Default gp3 writes at 125 MB/s** — about 20 minutes just to write 145 GB.
-  1000 MB/s costs ~$0.05/hr and brought the download to ~6 minutes.
-- **vLLM rejects `tool_choice: "auto"`** unless started with
-  `--enable-auto-tool-choice` and a parser, and Open WebUI sends it.
-- **Argo CD refuses to prune everything.** With `tier: none` the root app renders
-  no children, and Argo CD will not auto-sync a result that deletes every resource
-  ("auto-sync will wipe out all resources") unless `allowEmpty: true` is set.
-  Without it the GPUs would never switch off. Found by running the teardown on
-  kind before trusting it.
-- **Spot isn't always cheaper.** `g6e.xlarge` spot ran within 3% of on-demand,
-  with a spot placement score of 1/10 across the region.
 
 ---
 
@@ -607,52 +599,64 @@ Things the first real deploy surfaced that `terraform validate` could not:
 - **llm-d's real wins need scale.** Prefix-cache routing and prefill/decode
   disaggregation pay off across many GPUs. On one or two replicas you are
   exercising the control plane, not demonstrating a speedup.
+- **Spot means reclaims.** Google can take a Spot node with 30 seconds'
+  notice; the model pod restarts on a new node with a full cold start.
+  That is part of the lesson, not a bug.
+- **Cold starts are slow.** Every new node pulls a ~10 GB vLLM image and the
+  weights from Hugging Face. A ComputeClass cannot raise a Hyperdisk boot
+  disk's throughput, so Kimi's 145 GB takes longer than it did on a tuned EBS
+  volume.
 - **Argo CD's UI is not exposed.** Reach it with `make argocd-ui`
   (port-forward); there is no ingress or SSO.
-- **The Kimi tier cannot autoscale.** Quota fits exactly one 48-vCPU node; use
-  `small` or `gpu` to watch 1→2 scaling.
 - **Endpoints have no auth.** The model API and Open WebUI are protected only
   by the IP allowlist. Widen `ALLOWED_CIDRS` and you should turn
   `WEBUI_AUTH` back on in `gitops/values/open-webui.yaml`.
-- **Public subnets.** Nodes have public IPs (that is the no-NAT trade-off);
-  security groups are the boundary. Fine for a disposable lab, not a pattern
-  for production.
+- **Public nodes.** Nodes have external IPs (the no-NAT trade-off); the VPC
+  firewall is the boundary. Fine for a disposable lab, not a pattern for
+  production.
+- **The control-plane endpoint is open to `0.0.0.0/0`** (still behind Google
+  authentication) because CI runners and a laptop on a changing IP both need
+  it. Narrow `api_allowed_cidrs` for anything long-lived.
 - **Ephemeral by design.** No persistent volumes: Open WebUI chats and
   downloaded weights vanish with their pods.
 
-## Known gaps
+---
 
-What is proven and what is not, as of 2026-11-14.
+## Status
 
-**Proven**
+As of 2026-11-19: **ready to deploy, not deployed.**
 
-- The whole GitOps stack on a local kind cluster, built from `main`: every Argo CD app Synced and Healthy, a completion through the router, a chat through Open WebUI, `tier: none` pruning everything in about 45 seconds, and the tier coming back in about 20.
-- The same workloads on real EKS when Terraform applied them (before the move to Argo CD): Kimi-Dev-72B on two GPUs, Karpenter launching the node, tool calling accepted, and the destroy workflow removing the cluster and VPC.
-- Every chart, for every tier and environment, passes strict schema validation in CI.
+**Done and checked**
 
-**Not yet run on real AWS** (all gated behind `cluster: false`, so nothing spends money until you run `make cluster-on`)
+- Both Terraform layers pass `terraform validate`, and read-only plans run
+  against the real project: bootstrap would add 13 resources (Workload
+  Identity, the deploy service account and its roles, the L4 quota request,
+  the budget) and change or destroy nothing; `10-cluster` would create 12
+  (VPC, subnet, cluster, system pool, CRDs, KEDA, Prometheus, Argo CD, root
+  app, namespace, HF Secret).
+- Every chart renders for every tier in both environments, the guardrails
+  refuse bad input, and all 60 resources pass strict schema validation,
+  including the ComputeClass against GKE's CRD schema.
+- The workflows pass `actionlint`.
+- `cpus-all-regions` quota: 128 granted on the project.
 
-1. Terraform applying `argocd.tf`: the Argo CD install, the root Application, the HuggingFace Secret and the `kubectl` provider.
-2. Karpenter launching a node from the Argo-deployed NodePool and EC2NodeClass. The Terraform versions of these objects ran on EKS; the Helm-rendered ones have only been schema-checked.
-3. NLB source ranges on the Argo-rendered Services, fed from the `ALLOWED_CIDRS` secret through the root app.
-4. CI's verify job (wait for Argo CD, smoke test over a port-forward, `tier: none` check) and the cluster job with its new inputs. Only the scope job has run for real.
-5. The destroy workflow's new first step (delete the root app and let it cascade to NodePools and NLBs). The previous Terraform-based version, including the leaked-network-interface cleanup, is the one that was proven.
-6. `tier: none` on EKS. Proven on kind; EKS adds Karpenter node termination and NLB deletion timing.
+**Waiting on Google**
 
-**Cheapest way to close all six** (about $0.20): `make cluster-on` (about 20 minutes, ~$0.26/hr), `make tier TIER=sim` (adds ~$0.03/hr), check `make apps`, then `make tier TIER=none`, then `make cluster-off && make destroy`.
+- GPU quota on `gke-llm-lab-01`: RTX PRO 6000 and global GPUs are requested
+  and not yet granted (0). Until then, `small`, `gpu` and `kimi` pods stay
+  Pending (and cost nothing); `sim` works.
 
-**Design risks to know about**
+**Not yet run for real** — the first `make cluster-on` + `make tier TIER=sim`
+(about $0.20 for an hour) proves: the cluster apply, Argo CD convergence,
+ComputeClass-driven node creation, load balancer source ranges, the verify
+job, `tier: none`, and the destroy workflow.
 
-- **Nothing switches GPUs off automatically.** The nightly reaper was removed on purpose. A forgotten `kimi` tier costs about $200 a day; the budget alert is optional and lags by about a day. End sessions with `make tier TIER=none` or `make destroy`.
-- **Whoever can push to `main` controls the cluster.** Argo CD auto-syncs `main` with prune and self-heal, and the deploy role is AdministratorAccess. Branch protection blocks force-pushes and deletion but does not require reviews.
-- **The repo has to stay public.** Argo CD reads it without credentials. A fork must change `repoURL` in `gitops/root/values.yaml` and `gitops_repo_url` in `terraform/10-cluster/variables.tf`.
-- **Cost figures are estimates** from list prices and instance runtimes. Cost Explorer lags about a day, and the `Project` cost-allocation tag was only activated on 2026-11-14, so `make cost` has no history before that.
-- **The local kind proof was only run on an arm64 Mac.** Registries such as ghcr.io can be slow from a laptop, which is why `local/kind-prepull.sh` exists.
+**To go live**
 
-**Housekeeping**
-
-- `20-inference/terraform.tfstate` is an obsolete state object left in the S3 state bucket by the removed Terraform layer. It is harmless and can be deleted.
-- The remote `gitops` branch is fully merged into `main` and can be deleted.
+1. Create the GitHub repo and push `main`.
+2. `make bootstrap` (creates Workload Identity for that repo — the plan above).
+3. `make github-setup`.
+4. `make cluster-on`, then `make tier TIER=sim`.
 
 ---
 

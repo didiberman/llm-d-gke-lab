@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Free, local proof of the GitOps design (`make argocd-local`).
 #
-# Builds a kind cluster with the same platform Terraform installs on EKS
+# Builds a kind cluster with the same platform Terraform installs on GKE
 # (Gateway API + Inference Extension CRDs, KEDA, Prometheus, Argo CD from the
 # same values file), then hands over to Argo CD exactly as CI does: one root
 # Application pointing at this GitHub repo. Everything after that — router,
@@ -13,13 +13,14 @@
 #   TIER=sim                    tier to run locally (overrides deploy/config.yaml)
 #   GITOPS_REVISION=<branch>    git revision Argo CD tracks (default: current branch)
 #
-# Cost: $0. What kind cannot exercise: Karpenter, NLBs, real GPUs.
+# Cost: $0. What kind cannot exercise: GKE node auto-provisioning (ComputeClass),
+# cloud load balancers, real GPUs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CLUSTER=llm-d-argocd
 TIER=${TIER:-sim}
-REPO_URL=${REPO_URL:-https://github.com/didiberman/llm-d-eks-lab.git}
+REPO_URL=${REPO_URL:-https://github.com/didiberman/llm-d-gke-lab.git}
 REVISION=${GITOPS_REVISION:-$(git rev-parse --abbrev-ref HEAD)}
 
 # Keep aligned with terraform/10-cluster/variables.tf.
@@ -64,7 +65,7 @@ helm repo update kedacore prometheus-community argo >/dev/null
 
 step "KEDA ($KEDA_VERSION)"
 helm upgrade --install keda kedacore/keda -n keda --create-namespace --version "$KEDA_VERSION" \
-  --set nodeSelector."llm-d-eks-lab/role"=system --wait --timeout 15m >/dev/null
+  --set nodeSelector."llm-d-gke-lab/role"=system --wait --timeout 15m >/dev/null
 
 # Release name and namespace are what the ScaledObject queries:
 #   llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc:9090
@@ -75,25 +76,25 @@ helm upgrade --install llmd prometheus-community/kube-prometheus-stack -n llm-d-
   --set nodeExporter.enabled=false --set kubeStateMetrics.enabled=false \
   --set kubeApiServer.enabled=false --set kubeControllerManager.enabled=false \
   --set kubeScheduler.enabled=false --set kubeProxy.enabled=false --set kubeEtcd.enabled=false \
-  --set prometheusOperator.nodeSelector."llm-d-eks-lab/role"=system \
-  --set prometheus.prometheusSpec.nodeSelector."llm-d-eks-lab/role"=system \
+  --set prometheusOperator.nodeSelector."llm-d-gke-lab/role"=system \
+  --set prometheus.prometheusSpec.nodeSelector."llm-d-gke-lab/role"=system \
   --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
   --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
   --set prometheus.prometheusSpec.scrapeInterval=15s \
   --set prometheus.prometheusSpec.retention=2h \
   --wait --timeout 15m >/dev/null
 
-step "Argo CD ($ARGOCD_VERSION) — same values file Terraform uses on EKS"
+step "Argo CD ($ARGOCD_VERSION) — same values file Terraform uses on GKE"
 helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace --version "$ARGOCD_VERSION" \
   -f gitops/bootstrap/argocd-values.yaml --wait --timeout 15m >/dev/null
 
-step "Namespace and HF token secret (Terraform's job on EKS — secrets never live in git)"
+step "Namespace and HF token secret (Terraform's job on GKE — secrets never live in git)"
 kubectl create namespace llm-d --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n llm-d create secret generic llm-d-hf-token --from-literal="HF_TOKEN=${HF_TOKEN:-}" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 step "Root Application — from here on, Argo CD drives everything from git"
-# Same shape Terraform creates on EKS (terraform/10-cluster/argocd.tf); only the
+# Same shape Terraform creates on GKE (terraform/10-cluster/argocd.tf); only the
 # valuesObject differs: environment=kind and a local tier override.
 cat <<EOF | kubectl apply -f -
 apiVersion: argoproj.io/v1alpha1

@@ -42,7 +42,7 @@ terraform.rc
 # Optional: ignore plan files saved before destroying Terraform configuration
 # Uncomment the line below if you want to ignore planout files.
 # planout
-# All Terraform state lives in S3, including the bootstrap layer's.
+# All Terraform state lives in GCS, including the bootstrap layer's.
 .terraform/
 *.tfplan
 terraform.tfvars

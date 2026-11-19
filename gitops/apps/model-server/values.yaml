@@ -3,15 +3,9 @@
 # secrets-adjacent values that must not live in a public repo).
 
 # --- injected by the root app -------------------------------------------------
-environment: eks          # eks | kind
-project: llm-d-eks-lab
-karpenter:
-  # Off on kind: there is no EC2 to provision, the kind workers are labelled
-  # as model-server capacity instead.
-  enabled: true
-  nodeRole: ""            # Karpenter node IAM role name (Terraform output)
-  discoveryTag: llm-d-eks-lab
-allowedCidrs: []          # who may reach the public endpoints (EKS only)
+environment: gke          # gke | kind
+project: llm-d-gke-lab
+allowedCidrs: []          # who may reach the public endpoints (GKE only)
 webui:
   enabled: true
 
@@ -38,14 +32,22 @@ shmSize: 4Gi
 # 10s per attempt. Must cover image pull + weights download + load.
 startupProbeFailureThreshold: 60
 
+# GKE capacity for this tier, rendered as a ComputeClass (templates/
+# computeclass.yaml). `priorities` is passed through verbatim: GKE tries each
+# entry in order and, with whenUnsatisfiable DoNotScaleUp, waits rather than
+# fall back to anything not listed (e.g. on-demand GPUs at 2.6x the price).
+# Field reference: https://cloud.google.com/kubernetes-engine/docs/reference/crds/computeclass
 capacity:
-  instanceTypes: [c7i.large, m7i.large, c6i.large]
-  capacityTypes: [spot]
-  # NodePool vCPU ceiling — keep at or below the G/VT quota for the capacity type.
-  vcpuLimit: 16
-  diskSizeGb: 40
-  diskThroughputMbps: null
-  diskIops: null
+  priorities:
+    - machineType: e2-standard-2
+      spot: true
+      storage:
+        bootDiskType: pd-balanced
+        bootDiskSize: 40
+  whenUnsatisfiable: DoNotScaleUp
+  # How long a node must be unneeded before GKE removes it — Karpenter's
+  # consolidateAfter. Minimum 1.
+  consolidationDelayMinutes: 2
 
 autoscaling:
   minReplicas: 1

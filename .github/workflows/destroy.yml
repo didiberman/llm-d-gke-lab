@@ -4,18 +4,19 @@
 #
 # Order matters:
 #   1. Argo CD apps  delete the root Application. Its finalizer cascades through
-#                    every child app: NodePools go (Karpenter terminates the
-#                    GPU nodes) and the public Services go (EKS deletes their
-#                    NLBs, asynchronously).
-#   2. wait          for those NLBs and Karpenter nodes to actually disappear.
-#                    A leftover NLB holds ENIs and a security group in the VPC
-#                    and makes step 3 fail with DependencyViolation.
-#   3. 10-cluster    Argo CD, EKS, Karpenter, KEDA, Prometheus, VPC.
-#   4. sweep         leaked CNI interfaces and orphaned Karpenter instances,
-#                    then fail loudly if anything still bills.
+#                    every child app: the ComputeClasses go (GKE drains the GPU
+#                    nodes) and the LoadBalancer Services go (GKE deletes their
+#                    forwarding rules and firewall rules, asynchronously).
+#   2. wait          for those forwarding rules to actually disappear. A
+#                    leftover k8s load balancer keeps firewall rules in the VPC
+#                    and makes the network destroy in step 3 fail.
+#   3. 10-cluster    Argo CD, GKE (with every auto-provisioned node pool), the
+#                    subnet and the VPC.
+#   4. sweep         leaked k8s-* load balancer pieces, then fail loudly if
+#                    anything still bills.
 #
-# Left in place on purpose (~$0): 00-bootstrap — the S3 state bucket
-# (prevent_destroy) and the GitHub OIDC roles this workflow itself uses.
+# Left in place on purpose (~$0): 00-bootstrap — the project, the GCS state
+# bucket (prevent_destroy) and the Workload Identity setup this workflow uses.
 #
 # deploy/config.yaml is NOT changed. Set `cluster: false` too, or the next push
 # under terraform/10-cluster/ recreates the cluster.
@@ -35,12 +36,14 @@ permissions:
 
 # Same group as deploy: never race an apply for the state lock.
 concurrency:
-  group: aws-llm-d-eks-lab
+  group: gcp-llm-d-gke-lab
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-west-2
-  CLUSTER: llm-d-eks-lab
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: us-central1
+  ZONE: us-central1-b
+  CLUSTER: llm-d-gke-lab
   TF_IN_AUTOMATION: "1"
   TF_INPUT: "0"
   TF_VERSION: "1.13.4"
@@ -53,14 +56,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: aws-actions/configure-aws-credentials@v6
+      - uses: google-github-actions/auth@v3
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
-      - name: Mask account ID
-        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+      - uses: google-github-actions/setup-gcloud@v3
 
       - uses: hashicorp/setup-terraform@v4
         with:
@@ -71,19 +72,15 @@ jobs:
       # the configuration exactly as it was applied.
       - name: Terraform inputs
         env:
-          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          ADMIN_PRINCIPAL_ARN: ${{ vars.ADMIN_PRINCIPAL_ARN }}
-          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
           ALLOWED_CIDRS: ${{ secrets.ALLOWED_CIDRS }}
         run: |
           set -euo pipefail
-          [ -n "${{ vars.STATE_BUCKET }}" ] || { echo "::error::Repo variable STATE_BUCKET is not set"; exit 1; }
+          [ -n "$PROJECT_ID" ] || { echo "::error::Repo variable GCP_PROJECT_ID is not set"; exit 1; }
           {
-            echo "TF_VAR_region=$AWS_REGION"
-            echo "TF_VAR_project=$CLUSTER"
-            echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
-            [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
-            [ -n "$BUDGET_ALERT_EMAIL" ] && echo "TF_VAR_budget_alert_email=$BUDGET_ALERT_EMAIL"
+            echo "TF_VAR_project_id=$PROJECT_ID"
+            echo "TF_VAR_region=$REGION"
+            echo "TF_VAR_zone=$ZONE"
+            echo "TF_VAR_name=$CLUSTER"
             [ -n "$ALLOWED_CIDRS" ] && echo "TF_VAR_allowed_cidrs=$ALLOWED_CIDRS"
             true
           } >> "$GITHUB_ENV"
@@ -91,64 +88,50 @@ jobs:
       - name: Cluster present?
         id: cluster
         run: |
-          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+          if gcloud container clusters describe "$CLUSTER" --zone "$ZONE" --project "$PROJECT_ID" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No EKS cluster found — skipping the Argo CD teardown; 10-cluster is still destroyed if its state holds anything (e.g. a VPC left by a failed run)."
+            echo "No GKE cluster found — skipping the Argo CD teardown; 10-cluster is still destroyed if its state holds anything (e.g. a VPC left by a failed run)."
           fi
+
+      - uses: google-github-actions/get-gke-credentials@v3
+        if: steps.cluster.outputs.exists == 'true'
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.ZONE }}
+          project_id: ${{ env.PROJECT_ID }}
 
       # Deleting the root app (foreground) cascades through every child app
       # and what they deployed, thanks to the resources finalizers. Terraform
-      # would otherwise uninstall Argo CD first and orphan the NLBs and nodes.
-      - name: Delete the Argo CD apps (cascades to NodePools, NLBs, workloads)
+      # would otherwise uninstall Argo CD first and orphan the load balancers.
+      - name: Delete the Argo CD apps (cascades to ComputeClasses, load balancers, workloads)
         if: steps.cluster.outputs.exists == 'true'
         run: |
           set -uo pipefail
-          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER" >/dev/null
           if kubectl -n argocd get application root >/dev/null 2>&1; then
             kubectl -n argocd delete application root --cascade=foreground --wait=true --timeout=15m \
               || echo "::warning::Root app deletion did not finish in 15 minutes — falling back to direct deletes."
           fi
           # Backstop, in case Argo CD itself is broken.
           kubectl -n argocd delete applications.argoproj.io --all --wait=false 2>/dev/null || true
-          kubectl delete nodepools.karpenter.sh --all --wait=false 2>/dev/null || true
+          kubectl delete computeclasses.cloud.google.com -l "app.kubernetes.io/part-of=${CLUSTER}" --wait=false 2>/dev/null || true
           kubectl -n llm-d delete service --field-selector spec.type=LoadBalancer --wait=false 2>/dev/null || true
 
-      - name: Wait for Kubernetes-created load balancers and GPU nodes to go
+      # GKE tags what it creates for a LoadBalancer Service with the service
+      # name in the forwarding rule's description.
+      - name: Wait for Kubernetes-created load balancers to go
         if: steps.cluster.outputs.exists == 'true'
         run: |
           set -euo pipefail
           for i in $(seq 1 40); do
-            lbs=$(aws resourcegroupstaggingapi get-resources \
-              --resource-type-filters elasticloadbalancing:loadbalancer \
-              --tag-filters "Key=kubernetes.io/cluster/${CLUSTER}" \
-              --query 'length(ResourceTagMappingList)' --output text)
-            nodes=$(aws ec2 describe-instances \
-              --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
-                        "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
-                        "Name=instance-state-name,Values=pending,running,stopping,shutting-down" \
-              --query 'length(Reservations[].Instances[])' --output text)
-            echo "load balancers=$lbs karpenter nodes=$nodes"
-            [ "$lbs" = "0" ] && [ "$nodes" = "0" ] && exit 0
+            lbs=$(gcloud compute forwarding-rules list --project "$PROJECT_ID" \
+              --filter="description~kubernetes.io/service-name" --format='value(name)' | grep -c . || true)
+            echo "k8s load balancers=$lbs"
+            [ "$lbs" = "0" ] && exit 0
             sleep 15
           done
-          echo "::warning::Load balancers or Karpenter nodes still present after 10 minutes — continuing; the sweep step will report them."
-
-      # The VPC CNI attaches extra "aws-K8S-<instance>" ENIs to every node and
-      # normally deletes them when the node goes. If the cluster disappears
-      # first they are left detached ("available") in a subnet, holding the
-      # subnet and the node security group, and the VPC destroy fails with
-      # DependencyViolation after a 20-minute retry loop. Delete them first.
-      - name: Sweep leaked VPC CNI network interfaces
-        run: |
-          set -euo pipefail
-          vpc=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'Vpcs[0].VpcId' --output text)
-          [ "$vpc" = "None" ] && { echo "No project VPC."; exit 0; }
-          for id in $(aws ec2 describe-network-interfaces               --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" "Name=description,Values=aws-K8S-*"               --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-            echo "Deleting leaked CNI interface $id"
-            aws ec2 delete-network-interface --network-interface-id "$id"
-          done
+          echo "::warning::Load balancers still present after 10 minutes — continuing; the sweep step will remove them."
 
       # Not gated on the cluster existing: a previous run can die after the
       # cluster is gone but before the VPC is, and that VPC must still go.
@@ -156,80 +139,50 @@ jobs:
         working-directory: terraform/10-cluster
         run: |
           set -uo pipefail
-          terraform init -no-color \
-            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
-            -backend-config="region=${AWS_REGION}"
+          terraform init -no-color -backend-config="bucket=${PROJECT_ID}-tfstate"
           if [ -z "$(terraform state list 2>/dev/null)" ]; then
             echo "10-cluster state is empty — nothing to destroy."
             exit 0
           fi
           terraform destroy -no-color -auto-approve && exit 0
 
-          # Most likely an ENI that only became "available" after its node
-          # finished terminating. Sweep again and retry once.
-          echo "::warning::10-cluster destroy failed — sweeping leaked ENIs and retrying once."
-          vpc=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'Vpcs[0].VpcId' --output text)
-          if [ "$vpc" != "None" ]; then
-            sleep 60
-            for id in $(aws ec2 describe-network-interfaces \
-                --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" "Name=description,Values=aws-K8S-*" \
-                --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-              echo "Deleting leaked CNI interface $id"
-              aws ec2 delete-network-interface --network-interface-id "$id"
-            done
-          fi
+          # Most likely load balancer firewall rules or forwarding rules GKE
+          # left behind when the cluster went first. Sweep and retry once.
+          echo "::warning::10-cluster destroy failed — sweeping k8s load balancer leftovers and retrying once."
+          ../../scripts/sweep-k8s-lb.sh "$PROJECT_ID" "$REGION" "$CLUSTER"
           terraform destroy -no-color -auto-approve
 
-      # Karpenter terminates its nodes when a NodePool is deleted, but if the
-      # controller died first they are orphaned and Terraform never knew them.
-      - name: Sweep orphaned Karpenter instances
+      - name: Sweep k8s load balancer leftovers
         if: always()
-        run: |
-          ids=$(aws ec2 describe-instances \
-            --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
-                      "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
-                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text)
-          if [ -n "$ids" ]; then
-            echo "Terminating orphaned Karpenter instances: $ids"
-            aws ec2 terminate-instances --instance-ids $ids >/dev/null
-          else
-            echo "None."
-          fi
+        run: ./scripts/sweep-k8s-lb.sh "$PROJECT_ID" "$REGION" "$CLUSTER"
 
       - name: Verify nothing is still billing
         if: always()
         run: |
           set -u
-          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then clusters=1; else clusters=0; fi
-          instances=$(aws ec2 describe-instances \
-            --filters "Name=tag:Project,Values=${CLUSTER}" "Name=instance-state-name,Values=pending,running" \
-            --query 'length(Reservations[].Instances[])' --output text)
-          karp=$(aws ec2 describe-instances \
-            --filters "Name=tag-key,Values=karpenter.sh/nodepool" "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
-                      "Name=instance-state-name,Values=pending,running" \
-            --query 'length(Reservations[].Instances[])' --output text)
-          lbs=$(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer \
-            --tag-filters "Key=kubernetes.io/cluster/${CLUSTER}" --query 'length(ResourceTagMappingList)' --output text)
-          nats=$(aws ec2 describe-nat-gateways --filter Name=state,Values=available "Name=tag:Project,Values=${CLUSTER}" \
-            --query 'length(NatGateways)' --output text)
-          vpcs=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'length(Vpcs)' --output text)
+          count() { grep -c . || true; }
+          clusters=$(gcloud container clusters list --project "$PROJECT_ID" --format='value(name)' | count)
+          vms=$(gcloud compute instances list --project "$PROJECT_ID" --format='value(name)' | count)
+          disks=$(gcloud compute disks list --project "$PROJECT_ID" --format='value(name)' | count)
+          lbs=$(gcloud compute forwarding-rules list --project "$PROJECT_ID" --format='value(name)' | count)
+          ips=$(gcloud compute addresses list --project "$PROJECT_ID" --format='value(name)' | count)
+          nets=$(gcloud compute networks list --project "$PROJECT_ID" --filter="name=${CLUSTER}" --format='value(name)' | count)
           {
             echo "### Destroy report"
             echo "| Resource | Remaining |"
             echo "|---|---|"
-            echo "| EKS cluster | $clusters |"
-            echo "| Project-tagged instances | $instances |"
-            echo "| Karpenter instances | $karp |"
-            echo "| Cluster load balancers | $lbs |"
-            echo "| NAT gateways | $nats |"
-            echo "| Project VPCs | $vpcs |"
+            echo "| GKE clusters | $clusters |"
+            echo "| VMs | $vms |"
+            echo "| Disks | $disks |"
+            echo "| Forwarding rules (load balancers) | $lbs |"
+            echo "| Reserved IP addresses | $ips |"
+            echo "| Lab VPC | $nets |"
             echo ""
-            echo "Left on purpose: S3 state bucket and GitHub OIDC roles (00-bootstrap, ~\$0)."
+            echo "Left on purpose: the project, the GCS state bucket and Workload Identity (00-bootstrap, ~\$0)."
             echo "deploy/config.yaml is unchanged — set \`cluster: false\` or the next push under terraform/10-cluster/ recreates it."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
-          total=$((clusters + instances + karp + lbs + nats + vpcs))
+          total=$((clusters + vms + disks + lbs + ips + nets))
           if [ "$total" -ne 0 ]; then
             echo "::error title=Infrastructure still present::$total billable resource(s) remain — see the report."
             exit 1

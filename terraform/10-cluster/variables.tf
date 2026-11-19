@@ -1,84 +1,150 @@
+# ---------------------------------------------------------------------------
+# Project and placement. project_id and node_service_account come from the
+# 00-bootstrap outputs.
+# ---------------------------------------------------------------------------
+
+variable "project_id" {
+  description = "GCP project created by 00-bootstrap."
+  type        = string
+  default     = "gke-llm-lab-01"
+
+  nullable = false
+}
+
+variable "name" {
+  description = "Name of the cluster, network and subnet. Also the prefix of the Kubernetes node labels (<name>/role=system), which gitops/bootstrap and gitops/values hardcode as llm-d-gke-lab: change them together."
+  type        = string
+  default     = "llm-d-gke-lab"
+
+  nullable = false
+}
+
 variable "region" {
-  description = "AWS region. Keep in sync with the 00-bootstrap state bucket region."
+  description = "Region of the subnet. Must contain var.zone and var.node_zones."
   type        = string
-  default     = "us-west-2"
+  default     = "us-central1"
 
   nullable = false
 }
 
-variable "project" {
-  description = "Project slug used as the cluster name prefix and the Project cost-allocation tag."
+variable "zone" {
+  description = "Zone of the (zonal, free-tier) control plane and the system pool. Must also offer the GPU types in use."
   type        = string
-  default     = "llm-d-eks-lab"
+  default     = "us-central1-b"
 
   nullable = false
 }
 
-variable "kubernetes_version" {
-  description = "EKS control plane version. 1.37 is the current AWS default (standard support to 2027-12-01)."
-  type        = string
-  default     = "1.37"
-
-  nullable = false
-}
-
-variable "vpc_cidr" {
-  description = "VPC CIDR. /16 is far more than needed but leaves room for the pod IPs the VPC CNI hands out."
-  type        = string
-  default     = "10.0.0.0/16"
-
-  nullable = false
-}
-
-variable "az_count" {
-  description = "Number of availability zones. Three gives Karpenter room to find spot capacity; one AZ makes spot interruptions far more disruptive."
-  type        = number
-  default     = 3
+variable "node_zones" {
+  description = "Zones auto-provisioned (GPU) node pools may use. Three zones triples the chance of finding Spot capacity. us-central1 b/c/f all offer RTX PRO 6000 (G4); L4 (G2) is in a/b/c, so the overlap is b and c."
+  type        = list(string)
+  default     = ["us-central1-b", "us-central1-c", "us-central1-f"]
 
   validation {
-    condition     = var.az_count >= 2 && var.az_count <= 4
-    error_message = "EKS requires subnets in at least 2 AZs; more than 4 is pointless here."
+    condition     = length(var.node_zones) >= 1
+    error_message = "At least one zone is required."
   }
 
   nullable = false
 }
 
-variable "system_instance_types" {
-  description = "Instance types for the system node group that hosts Karpenter, Istio and KEDA. Deliberately tiny and non-GPU."
-  type        = list(string)
-  default     = ["t3.xlarge", "t3a.xlarge", "m6i.xlarge"]
+variable "node_service_account" {
+  description = "Service account GKE nodes run as (00-bootstrap output gke_node_service_account). Null = the gke-nodes account 00-bootstrap creates in var.project_id."
+  type        = string
+  default     = null
+}
+
+variable "labels" {
+  description = "GCP labels on the cluster and its node VMs, so billing reports can group spend."
+  type        = map(string)
+
+  default = {
+    project    = "gke-llm-lab"
+    managed-by = "terraform"
+  }
 
   nullable = false
 }
 
-variable "system_node_desired_size" {
-  description = "System node count. Two spreads the platform controllers across AZs; one is cheaper but a single spot reclaim takes the cluster's brain with it."
-  type        = number
-  default     = 2
+variable "node_cidr" {
+  description = "Primary range of the subnet (node IPs)."
+  type        = string
+  default     = "10.0.0.0/20"
+
+  nullable = false
+}
+
+variable "pod_cidr" {
+  description = "Secondary range for pod IPs. /16 = 256 nodes at the default 110 pods/node."
+  type        = string
+  default     = "10.16.0.0/16"
+
+  nullable = false
+}
+
+variable "service_cidr" {
+  description = "Secondary range for ClusterIP Services."
+  type        = string
+  default     = "10.32.0.0/20"
 
   nullable = false
 }
 
 variable "api_allowed_cidrs" {
-  description = "CIDRs allowed to reach the public EKS API endpoint. Defaults to open because a locked-down default makes a practice cluster unusable from a changing IP; narrow it to your own /32 for anything you leave running."
+  description = "CIDRs allowed to reach the public GKE control-plane endpoint. Open by default because CI runners and a laptop on a changing IP both need it; narrow it for anything left running."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 
   nullable = false
 }
 
-variable "budget_limit_usd" {
-  description = "Monthly budget in USD that triggers the SNS email alert. It reports spend after the fact; `tier: none` and the destroy workflow are what stop it."
-  type        = number
-  default     = 50
+# ---------------------------------------------------------------------------
+# Capacity. The system pool is always on; GPU nodes exist only while a tier's
+# pods need them, and never beyond the ceilings below.
+# ---------------------------------------------------------------------------
+
+variable "system_machine_type" {
+  description = "System pool machine type (Spot). e2-standard-4 = 4 vCPU / 16 GB, ~$0.08/hr Spot in us-central1."
+  type        = string
+  default     = "e2-standard-4"
 
   nullable = false
 }
 
-variable "budget_alert_email" {
-  description = "Email for budget alerts. Leave null to skip creating the budget and SNS topic entirely."
-  type        = string
-  default     = null
+variable "system_max_nodes" {
+  description = "Upper bound of the system pool autoscaler. Usually 1-2 nodes are in use."
+  type        = number
+  default     = 3
+
+  nullable = false
+}
+
+variable "max_vcpus" {
+  description = "Cluster-wide vCPU ceiling for the autoscaler, system pool included. 2 x g4-standard-48 (96) + system headroom. Keep at or below the project's CPUS-ALL-REGIONS quota (128)."
+  type        = number
+  default     = 120
+
+  nullable = false
+}
+
+variable "max_memory_gb" {
+  description = "Cluster-wide memory ceiling (GB). 2 x g4-standard-48 (360) + system headroom."
+  type        = number
+  default     = 420
+
+  nullable = false
+}
+
+variable "max_gpus" {
+  description = "Cluster-wide GPU ceilings by GKE accelerator type: the hard cost guard. A type absent here can never be provisioned. 2 RTX PRO 6000 = the gpu tier's 1->2 Spot replicas (~$3.44/hr at most)."
+  type        = map(number)
+
+  default = {
+    "nvidia-rtx-pro-6000" = 2
+    "nvidia-l4"           = 2
+  }
+
+  nullable = false
 }
 
 # Pinned to the llm-d v1.0.0 tested matrix, NOT to latest upstream. Istio's
@@ -132,26 +198,6 @@ variable "keda_version" {
   nullable = false
 }
 
-variable "karpenter_version" {
-  description = "Karpenter Helm chart version."
-  type        = string
-  default     = "1.15.1"
-
-  nullable = false
-}
-
-variable "admin_principal_arn" {
-  description = "IAM principal (user or role) granted cluster-admin for kubectl from a workstation. Null to grant no human access."
-  type        = string
-  default     = null
-}
-
-variable "deploy_role_arn" {
-  description = "IAM role ARN from the 00-bootstrap github_deploy_role_arn output. Granted cluster-admin so the deploy workflow can manage Helm releases and the inference layer."
-  type        = string
-  default     = null
-}
-
 # ---------------------------------------------------------------------------
 # GitOps (Argo CD). Terraform installs Argo CD and one root Application; the
 # inference layer itself is reconciled from gitops/ in this repo.
@@ -165,10 +211,18 @@ variable "argocd_chart_version" {
   nullable = false
 }
 
+variable "argocd_apps_chart_version" {
+  description = "argocd-apps Helm chart version (https://argoproj.github.io/argo-helm), which creates the root Application."
+  type        = string
+  default     = "2.0.8"
+
+  nullable = false
+}
+
 variable "gitops_repo_url" {
   description = "Git repository Argo CD reconciles from. Must be readable without credentials (public)."
   type        = string
-  default     = "https://github.com/didiberman/llm-d-eks-lab.git"
+  default     = "https://github.com/didiberman/llm-d-gke-lab.git"
 
   nullable = false
 }
@@ -182,7 +236,7 @@ variable "gitops_revision" {
 }
 
 variable "allowed_cidrs" {
-  description = "CIDRs allowed to reach the public endpoints (model API, Open WebUI). Injected into the root Application, never committed to git. The model-server chart refuses to render on EKS if this is empty."
+  description = "CIDRs allowed to reach the public endpoints (model API, Open WebUI). Injected into the root Application, never committed to git. The model-server chart refuses to render on GKE if this is empty."
   type        = list(string)
   default     = []
 

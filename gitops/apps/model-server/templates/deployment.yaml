@@ -24,8 +24,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      # One GPU per replica and a hard quota ceiling: surging would ask for a
-      # node that cannot exist, so updates replace in place.
+      # One GPU per replica and a hard GPU ceiling (quota and the cluster's
+      # resource_limits): surging would ask for a node that cannot exist, so
+      # updates replace in place.
       maxSurge: 0
       maxUnavailable: 1
   template:
@@ -36,9 +37,17 @@ spec:
       # Must exceed vLLM's --shutdown-timeout so in-flight requests drain.
       terminationGracePeriodSeconds: 60
       nodeSelector:
-        llm-d-eks-lab/role: model-server
-        llm-d-eks-lab/tier: {{ .Values.tier }}
+        {{- if eq .Values.environment "gke" }}
+        # Selecting the class is what makes GKE provision for this pod; GKE
+        # also adds the toleration for the class's own node taint.
+        cloud.google.com/compute-class: {{ include "ms.computeclass" . }}
+        {{- else }}
+        # kind: workers pre-labelled in local/kind-argocd.yaml.
+        {{ .Values.project }}/role: model-server
+        {{ .Values.project }}/tier: {{ .Values.tier }}
+        {{- end }}
       {{- if .Values.gpu.enabled }}
+      # GKE taints GPU nodes nvidia.com/gpu=present:NoSchedule.
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
@@ -65,7 +74,7 @@ spec:
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
-                  # Created by Terraform (EKS) or local/argocd-up.sh (kind) —
+                  # Created by Terraform (GKE) or local/argocd-up.sh (kind) —
                   # a secret value cannot live in a public repo.
                   name: llm-d-hf-token
                   key: HF_TOKEN

@@ -1,9 +1,9 @@
 # kind cluster for the free GitOps proof (`make argocd-local`).
 #
-# Mirrors the EKS node layout: one worker labelled as a system node (Argo CD,
-# KEDA, Prometheus, Open WebUI land here, as on the EKS system node group) and
-# two labelled as model-server capacity, standing in for the nodes Karpenter
-# would launch. Karpenter itself cannot run here — it provisions EC2.
+# Mirrors the GKE node layout: one worker labelled as a system node (Argo CD,
+# KEDA, Prometheus, Open WebUI land here, as on the GKE system pool) and two
+# labelled as model-server capacity, standing in for the nodes a ComputeClass
+# would make GKE provision. That provisioning itself cannot run here.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: llm-d-argocd
@@ -20,12 +20,12 @@ nodes:
         protocol: TCP
   - role: worker
     labels:
-      llm-d-eks-lab/role: system
+      llm-d-gke-lab/role: system
   - role: worker
     labels:
-      llm-d-eks-lab/role: model-server
-      llm-d-eks-lab/tier: sim
+      llm-d-gke-lab/role: model-server
+      llm-d-gke-lab/tier: sim
   - role: worker
     labels:
-      llm-d-eks-lab/role: model-server
-      llm-d-eks-lab/tier: sim
+      llm-d-gke-lab/role: model-server
+      llm-d-gke-lab/tier: sim

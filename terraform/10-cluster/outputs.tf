@@ -1,56 +1,30 @@
 output "cluster_name" {
-  description = "EKS cluster name."
-  value       = module.eks.cluster_name
+  description = "GKE cluster name."
+  value       = google_container_cluster.this.name
+}
+
+output "cluster_location" {
+  description = "Zone of the control plane."
+  value       = google_container_cluster.this.location
 }
 
 output "cluster_endpoint" {
-  description = "EKS API server endpoint."
-  value       = module.eks.cluster_endpoint
+  description = "GKE API server endpoint."
+  value       = local.k8s_host
 }
 
-output "cluster_certificate_authority_data" {
-  description = "Base64 CA bundle for the cluster, for downstream providers."
-  value       = module.eks.cluster_certificate_authority_data
-  sensitive   = true
-}
-
-output "oidc_provider_arn" {
-  description = "IRSA OIDC provider ARN."
-  value       = module.eks.oidc_provider_arn
-}
-
-output "region" {
-  description = "Region the cluster lives in."
-  value       = var.region
-}
-
-output "vpc_id" {
-  description = "VPC ID."
-  value       = module.vpc.vpc_id
-}
-
-output "public_subnet_ids" {
-  description = "Public subnets, discovered by Karpenter EC2NodeClasses via the karpenter.sh/discovery tag."
-  value       = module.vpc.public_subnets
-}
-
-output "karpenter_node_iam_role_name" {
-  description = "IAM role Karpenter EC2NodeClasses assign to nodes; injected into the root Argo CD app."
-  value       = module.karpenter.node_iam_role_name
-}
-
-output "karpenter_discovery_tag" {
-  description = "Value of the karpenter.sh/discovery tag on subnets and the node security group."
-  value       = var.project
+output "project_id" {
+  description = "Project the cluster lives in."
+  value       = var.project_id
 }
 
 output "kubeconfig_command" {
-  description = "Run this to point kubectl at the cluster."
-  value       = "aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}"
+  description = "Point kubectl at the cluster (needs gke-gcloud-auth-plugin: `gcloud components install gke-gcloud-auth-plugin`)."
+  value       = "gcloud container clusters get-credentials ${google_container_cluster.this.name} --zone ${google_container_cluster.this.location} --project ${var.project_id}"
 }
 
-output "nat_gateway_count" {
-  description = "Always 0. Asserted as an output so a regression is visible in the plan diff rather than only on the bill."
+output "nat_count" {
+  description = "Always 0. Asserted as an output so a regression shows in the plan diff, not only on the bill."
   value       = 0
 }
 

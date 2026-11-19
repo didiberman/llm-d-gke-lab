@@ -1,7 +1,8 @@
-# gpu — g6e.xlarge = 1x L40S (44 GB). Qwen3.6-27B-FP8 is 28.7 GB of weights,
-# ~13 GB of KV cache. Spot, 1->2 replicas (8-vCPU spot quota / 4 vCPU).
-# g6e.xlarge has only 32 GB of host RAM against 28.7 GB of weights; if loading
-# misbehaves, g6e.2xlarge is the fix at the cost of the whole spot quota.
+# gpu — g4-standard-48 = 1x RTX PRO 6000 Blackwell (96 GB), 48 vCPU, 180 GB
+# RAM. Qwen3.6-27B-FP8 is 28.7 GB of weights, leaving ~60 GB of KV cache —
+# room for long contexts and real concurrency. Spot ~$1.72/hr per replica,
+# 1->2 replicas: the two-node shape this lab was sized around (2 GPUs of
+# RTX_PRO_6000 quota, 96 vCPU).
 tier: gpu
 model: Qwen/Qwen3.6-27B-FP8
 image: docker.io/vllm/vllm-openai:v0.30.0
@@ -11,9 +12,10 @@ gpu:
 args:
   - --port
   - "8000"
+  # Native context is far longer; 32k keeps most of the 96 GB for concurrent
+  # requests' KV cache rather than one huge one.
   - --max-model-len
-  - "16384"
-  # 0.95+ on 44 GB with 28.7 GB of weights tends to OOM during graph capture.
+  - "32768"
   - --gpu-memory-utilization
   - "0.92"
   # Qwen3.5+ are multimodal; the vision tower costs VRAM we want for KV cache.
@@ -24,14 +26,25 @@ args:
   - --shutdown-timeout
   - "45"
 resources:
-  cpuRequest: "2"
-  memoryRequest: 16Gi
-  memoryLimit: 24Gi
+  cpuRequest: "4"
+  memoryRequest: 32Gi
+  # Headroom for page cache while 28.7 GB of safetensors stream to the GPU;
+  # the node has 180 GB and nothing else on it.
+  memoryLimit: 96Gi
 capacity:
-  instanceTypes: [g6e.xlarge]
-  capacityTypes: [spot]
-  vcpuLimit: 8
-  diskSizeGb: 200
+  priorities:
+    - machineType: g4-standard-48
+      spot: true
+      gpu:
+        type: nvidia-rtx-pro-6000
+        count: 1
+        driverVersion: latest
+      storage:
+        # G4 boots from Hyperdisk only; Persistent Disk types are rejected.
+        bootDiskType: hyperdisk-balanced
+        bootDiskSize: 200
+  whenUnsatisfiable: DoNotScaleUp
+  consolidationDelayMinutes: 2
 autoscaling:
   minReplicas: 1
   maxReplicas: 2

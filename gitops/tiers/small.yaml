@@ -1,6 +1,8 @@
-# small — a real GPU, a small model. g6.xlarge = 1x L4 (22 GB). Qwen3.5-4B is
-# 8.7 GB of weights, ~11 GB left for KV cache. Spot: two of these fit the
-# 8-vCPU G/VT spot quota, so 1->2 scale-out is observable.
+# small — a real GPU, a small model. g2-standard-4 = 1x L4 (24 GB), 4 vCPU,
+# 16 GB RAM. Qwen3.5-4B is 8.7 GB of weights, ~12 GB left for KV cache.
+# Spot ~$0.42/hr per replica, 1->2 replicas if the project's L4 quota is 2
+# (NVIDIA_L4 family in the region, and GPUS-ALL-REGIONS). L4 is offered in
+# us-central1-a/b/c; GKE only places it in the cluster's zones that have it.
 tier: small
 model: Qwen/Qwen3.5-4B
 image: docker.io/vllm/vllm-openai:v0.30.0
@@ -25,10 +27,19 @@ resources:
   memoryRequest: 8Gi
   memoryLimit: 12Gi
 capacity:
-  instanceTypes: [g6.xlarge]
-  capacityTypes: [spot]
-  vcpuLimit: 8
-  diskSizeGb: 100
+  priorities:
+    - machineType: g2-standard-4
+      spot: true
+      gpu:
+        type: nvidia-l4
+        count: 1
+        driverVersion: latest
+      storage:
+        # G2 boots from Persistent Disk; ~10 GB image + 9 GB weights + room.
+        bootDiskType: pd-balanced
+        bootDiskSize: 100
+  whenUnsatisfiable: DoNotScaleUp
+  consolidationDelayMinutes: 2
 autoscaling:
   minReplicas: 1
   maxReplicas: 2

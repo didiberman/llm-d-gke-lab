@@ -2,9 +2,11 @@
 SHELL := /bin/bash
 .ONESHELL:
 
-REGION      ?= us-west-2
-PROJECT     ?= llm-d-eks-lab
-CLUSTER     ?= $(PROJECT)
+PROJECT_ID  ?= gke-llm-lab-01
+REGION      ?= us-central1
+ZONE        ?= us-central1-b
+CLUSTER     ?= llm-d-gke-lab
+REPO        ?= didiberman/llm-d-gke-lab
 TF          ?= terraform
 # Set AUTO=-auto-approve to apply without the interactive prompt (bootstrap and
 # break-glass only).
@@ -12,13 +14,21 @@ AUTO        ?=
 BOOTSTRAP   := terraform/00-bootstrap
 CLUSTER_DIR := terraform/10-cluster
 CONFIG      := deploy/config.yaml
+STATE_BUCKET = $(PROJECT_ID)-tfstate
+
+# User credentials (gcloud ADC) bill API calls to a "quota project". A stale
+# one in ~/.config/gcloud makes every call 400 with "User project specified in
+# the request is invalid", so pin it to the lab project.
+export GOOGLE_CLOUD_QUOTA_PROJECT := $(PROJECT_ID)
+export CLOUDSDK_BILLING_QUOTA_PROJECT := $(PROJECT_ID)
+GCLOUD := gcloud --project $(PROJECT_ID)
 
 ##@ Help
 
 .PHONY: help
 help: ## Show this help
-	@awk 'BEGIN {FS=":.*##"; printf "\nllm-d-eks-lab\n"} \
-	/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } \
+	@awk 'BEGIN {FS=":.*##"; printf "\nllm-d-gke-lab\n"} \
+	/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } \
 	/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0,5) }' $(MAKEFILE_LIST)
 	@echo ""
 
@@ -40,7 +50,7 @@ tier: ## Run a tier: make tier TIER=none|sim|small|gpu|kimi (commits deploy/conf
 	$(call set_config,tier,$(TIER))
 
 .PHONY: cluster-on
-cluster-on: ## Allow CI to create/keep the EKS cluster (~$0.26/hr from then on)
+cluster-on: ## Allow CI to create/keep the GKE cluster (~$0.09/hr idle from then on)
 	$(call set_config,cluster,true)
 
 .PHONY: cluster-off
@@ -68,12 +78,11 @@ destroy: ## Run the destroy workflow: tear down ALL billable infra (asks you to 
 ##@ Cluster access
 
 .PHONY: kubeconfig
-kubeconfig: ## Point local kubectl at the EKS cluster (context alias: llm-d-eks-lab)
-	@# --region is explicit: the CLI default region may differ from the
-	@# cluster's, and then update-kubeconfig reports "No cluster found".
-	@aws eks update-kubeconfig --region $(REGION) --name $(CLUSTER) --alias $(CLUSTER) >/dev/null
+kubeconfig: ## Point local kubectl at the GKE cluster (needs gke-gcloud-auth-plugin)
+	@$(GCLOUD) container clusters get-credentials $(CLUSTER) --zone $(ZONE) >/dev/null
+	@kubectl config rename-context gke_$(PROJECT_ID)_$(ZONE)_$(CLUSTER) $(CLUSTER) >/dev/null 2>&1 || true
 	@kubectl config use-context $(CLUSTER) >/dev/null
-	@echo "kubectl context: $(CLUSTER) (region $(REGION))"
+	@echo "kubectl context: $(CLUSTER) ($(PROJECT_ID), $(ZONE))"
 	@kubectl get nodes
 
 .PHONY: argocd-ui
@@ -88,17 +97,17 @@ apps: ## Argo CD application status in the current kubectl context
 
 .PHONY: watch
 watch: ## Watch autoscaling and node provisioning live
-	@watch -n 2 'kubectl -n llm-d get scaledobject,hpa,pods 2>/dev/null; echo; kubectl get nodes -L llm-d-eks-lab/role,karpenter.sh/capacity-type,node.kubernetes.io/instance-type 2>/dev/null'
+	@watch -n 2 'kubectl -n llm-d get scaledobject,hpa,pods 2>/dev/null; echo; kubectl get computeclasses.cloud.google.com -l app.kubernetes.io/part-of=$(CLUSTER) 2>/dev/null; echo; kubectl get nodes -L cloud.google.com/compute-class,cloud.google.com/gke-spot,node.kubernetes.io/instance-type,cloud.google.com/gke-accelerator 2>/dev/null'
 
 .PHONY: load
-load: ## Fire k6 at the model endpoint (EKS NLB, or BASE_URL=...) and watch replicas scale
+load: ## Fire k6 at the model endpoint (GKE load balancer, or BASE_URL=...) and watch replicas scale
 	@tier=$$(awk '/^tier:/{print $$2}' $(CONFIG)); \
 	[ "$$tier" = none ] && tier=sim; \
 	model=$$(awk '/^model:/{print $$2}' gitops/tiers/$$tier.yaml); \
 	url="$(BASE_URL)"; \
 	if [ -z "$$url" ]; then \
-	  host=$$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
-	  if [ -n "$$host" ]; then url="http://$$host"; else url="http://localhost:18080"; fi; \
+	  ip=$$(kubectl -n llm-d get svc llm-d-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null); \
+	  if [ -n "$$ip" ]; then url="http://$$ip"; else url="http://localhost:18080"; fi; \
 	fi; \
 	echo "Load target: $$url  model: $$model"; \
 	if command -v k6 >/dev/null; then \
@@ -121,69 +130,65 @@ argocd-local-down: ## Delete the local kind cluster
 ##@ Cost & safety
 
 .PHONY: prices
-prices: ## Re-measure current spot prices for the instance types this project uses
+prices: ## Re-measure current Spot/on-demand prices for the machine shapes this project uses
 	@./scripts/prices.sh $(REGION)
 
 .PHONY: cost
-cost: ## Actual spend to date, attributed by the Project tag
-	@start=$$(date -u -v-30d +%Y-%m-%d 2>/dev/null || date -u -d '30 days ago' +%Y-%m-%d)
-	@end=$$(date -u +%Y-%m-%d)
-	@aws ce get-cost-and-usage --region us-east-1 \
-	  --time-period Start=$$start,End=$$end \
-	  --granularity MONTHLY --metrics UnblendedCost \
-	  --filter '{"Tags":{"Key":"Project","Values":["$(PROJECT)"]}}' \
-	  --group-by Type=DIMENSION,Key=SERVICE \
-	  --query 'ResultsByTime[].Groups[].{Service:Keys[0],USD:Metrics.UnblendedCost.Amount}' \
-	  --output table
+cost: ## Where to see actual spend (GCP has no CLI for it; the budget emails at 50/90/100%)
+	@echo "Billing reports for this project (grouped by SKU):"
+	@echo "  https://console.cloud.google.com/billing/reports?project=$(PROJECT_ID)"
+	@echo "Budget alerts are set by 00-bootstrap (budget_amount)."
 
 .PHONY: quota
-quota: ## Show G/VT GPU quota (spot and on-demand) and pending increase requests
-	@echo "== current limits ($(REGION)) — denominated in vCPUs"
-	@aws service-quotas list-service-quotas --service-code ec2 --region $(REGION) \
-	  --query 'Quotas[?contains(QuotaName,`G and VT`)].{Code:QuotaCode,Name:QuotaName,vCPUs:Value}' \
-	  --output table
-	@echo "== what the tiers need: small/gpu 4 spot vCPU per replica; kimi 48 on-demand vCPU"
-	@echo "== pending requests"
-	@aws service-quotas list-requested-service-quota-change-history \
-	  --service-code ec2 --region $(REGION) \
-	  --query 'RequestedQuotas[].{Name:QuotaName,Desired:DesiredValue,Status:Status,Case:CaseId}' \
-	  --output table
+quota: ## GPU/vCPU quota the tiers need, and the state of the increase requests
+	@echo "== quota preferences (requested vs granted)"
+	@$(GCLOUD) beta quotas preferences list \
+	  --format='table(name.basename():label=REQUEST,quotaId,dimensions,quotaConfig.preferredValue:label=ASKED,quotaConfig.grantedValue:label=GRANTED,reconciling)'
+	@echo "== what the tiers need: sim 2 vCPU | small 1 L4 + 4 vCPU per replica | gpu 1 RTX PRO 6000 + 48 vCPU per replica | kimi 2 RTX PRO 6000 + 96 vCPU"
+	@echo "== console: https://console.cloud.google.com/iam-admin/quotas?project=$(PROJECT_ID)"
 
 .PHONY: whats-running
-whats-running: ## Anything in this account currently costing money for this project
-	@echo "== EKS clusters"; aws eks list-clusters --region $(REGION) --query clusters --output text
-	@echo "== EC2 instances"; aws ec2 describe-instances --region $(REGION) \
-	  --filters Name=instance-state-name,Values=running,pending \
-	  --query 'Reservations[].Instances[].{Type:InstanceType,Id:InstanceId,Life:InstanceLifecycle}' --output table
-	@echo "== load balancers"; aws elbv2 describe-load-balancers --region $(REGION) \
-	  --query 'LoadBalancers[].{Name:LoadBalancerName,Type:Type}' --output table
-	@echo "== NAT gateways (should be empty — they are the big leak)"
-	@aws ec2 describe-nat-gateways --region $(REGION) \
-	  --filter Name=state,Values=available --query 'NatGateways[].NatGatewayId' --output text
+whats-running: ## Anything in the project currently costing money
+	@echo "== GKE clusters";       $(GCLOUD) container clusters list --format='table(name,location,status,currentNodeCount)'
+	@echo "== VMs";                $(GCLOUD) compute instances list --format='table(name,zone.basename(),machineType.basename(),scheduling.provisioningModel,status)'
+	@echo "== load balancers";     $(GCLOUD) compute forwarding-rules list --format='table(name,region.basename(),IPAddress)'
+	@echo "== disks";              $(GCLOUD) compute disks list --format='table(name,zone.basename(),sizeGb,users.len():label=ATTACHED)'
+	@echo "== Cloud NAT routers (should be empty)"; $(GCLOUD) compute routers list --format='value(name)'
 
 ##@ Bootstrap & break-glass
 
 .PHONY: bootstrap
-bootstrap: ## Apply 00-bootstrap: state bucket + CI deploy role (the one layer applied locally)
-	@acct=$$(aws sts get-caller-identity --query Account --output text); \
-	cd $(BOOTSTRAP) && $(TF) init -input=false \
-	  -backend-config="bucket=$(PROJECT)-tfstate-$$acct" -backend-config="region=$(REGION)" && \
-	  $(TF) apply -input=false $(AUTO) -var region=$(REGION) -var project=$(PROJECT)
+bootstrap: ## Apply 00-bootstrap: project, state bucket, quota requests, WIF + deploy SA (the one layer applied locally)
+	cd $(BOOTSTRAP) && $(TF) init -input=false && $(TF) apply -input=false $(AUTO)
 
-STATE_BUCKET = $(PROJECT)-tfstate-$(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
+.PHONY: github-setup
+github-setup: ## Set the repo's Actions variable + secrets from the bootstrap outputs (ALLOWED_CIDRS=... HF_TOKEN=... optional)
+	@set -euo pipefail
+	cd $(BOOTSTRAP)
+	wip=$$($(TF) output -raw workload_identity_provider)
+	sa=$$($(TF) output -raw deploy_service_account)
+	[ -n "$$wip" ] && [ "$$wip" != null ] || { echo "No WIF provider yet — set github_repo in terraform.tfvars and run make bootstrap"; exit 1; }
+	gh variable set GCP_PROJECT_ID --repo $(REPO) --body "$(PROJECT_ID)"
+	gh secret set GCP_WORKLOAD_IDENTITY_PROVIDER --repo $(REPO) --body "$$wip"
+	gh secret set GCP_DEPLOY_SERVICE_ACCOUNT --repo $(REPO) --body "$$sa"
+	cidrs="$(ALLOWED_CIDRS)"; [ -n "$$cidrs" ] || cidrs="[\"$$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32\"]"
+	gh secret set ALLOWED_CIDRS --repo $(REPO) --body "$$cidrs"
+	[ -z "$(HF_TOKEN)" ] || gh secret set HF_TOKEN --repo $(REPO) --body "$(HF_TOKEN)"
+	echo "Set on $(REPO): GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_DEPLOY_SERVICE_ACCOUNT, ALLOWED_CIDRS=$$cidrs"
 
 .PHONY: cluster-plan
-cluster-plan: ## Read-only: plan 10-cluster from your machine
-	cd $(CLUSTER_DIR) && $(TF) init -input=false -reconfigure \
-	  -backend-config="bucket=$(STATE_BUCKET)" -backend-config="region=$(REGION)" && \
-	  $(TF) plan -input=false -var region=$(REGION) -var project=$(PROJECT)
+cluster-plan: ## Read-only: plan 10-cluster from your machine (no state lock)
+	cd $(CLUSTER_DIR) && $(TF) init -input=false -reconfigure -backend-config="bucket=$(STATE_BUCKET)" && \
+	  TF_VAR_allowed_cidrs='$(or $(ALLOWED_CIDRS),["203.0.113.7/32"])' \
+	  $(TF) plan -input=false -lock=false -var project_id=$(PROJECT_ID) -var zone=$(ZONE) -var region=$(REGION)
 
 .PHONY: cluster-apply-local
-cluster-apply-local: ## BREAK-GLASS: apply 10-cluster locally (requires ALLOW_LOCAL=1)
-	@[ -n "$(ALLOW_LOCAL)" ] || { echo "Deploys run in CI (make cluster-on / make deploy). Break-glass: ALLOW_LOCAL=1 make $@"; exit 1; }
-	cd $(CLUSTER_DIR) && $(TF) init -input=false -reconfigure \
-	  -backend-config="bucket=$(STATE_BUCKET)" -backend-config="region=$(REGION)" && \
-	  $(TF) apply -input=false $(AUTO) -var region=$(REGION) -var project=$(PROJECT)
+cluster-apply-local: ## BREAK-GLASS: apply 10-cluster locally (requires ALLOW_LOCAL=1 and ALLOWED_CIDRS)
+	@[ -n "$(ALLOW_LOCAL)" ] || { echo "Deploys run in CI (make cluster-on / make deploy). Break-glass: ALLOW_LOCAL=1 ALLOWED_CIDRS='[\"x.x.x.x/32\"]' make $@"; exit 1; }
+	@[ -n "$(ALLOWED_CIDRS)" ] || { echo "ALLOWED_CIDRS is required, e.g. ALLOWED_CIDRS='[\"1.2.3.4/32\"]'"; exit 1; }
+	cd $(CLUSTER_DIR) && $(TF) init -input=false -reconfigure -backend-config="bucket=$(STATE_BUCKET)" && \
+	  TF_VAR_allowed_cidrs='$(ALLOWED_CIDRS)' \
+	  $(TF) apply -input=false $(AUTO) -var project_id=$(PROJECT_ID) -var zone=$(ZONE) -var region=$(REGION)
 
 ##@ Checks
 

@@ -1,9 +1,0 @@
-# Advertises nvidia.com/gpu on GPU nodes. The EKS AL2023 NVIDIA AMI ships the
-# driver and container toolkit but not this DaemonSet; without it the model
-# server stays Pending on a node that is billing.
-nodeSelector:
-  llm-d-eks-lab/role: model-server
-tolerations:
-  - key: nvidia.com/gpu
-    operator: Exists
-    effect: NoSchedule
